@@ -6,6 +6,7 @@ and transforms both DataFrames.  Operations are applied in pipeline order,
 so later steps can reference features created by earlier steps.
 """
 
+import builtins as _builtins
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
@@ -34,6 +35,8 @@ ALLOWED_OPS = {
     "drop", "select",
     # scaling (fit on train)
     "scale",
+    # freestyle (opt-in, guarded by agent.py validation)
+    "freestyle",
 }
 
 
@@ -374,3 +377,152 @@ def _op_scale(step, tr, va):
     tr_arr = scaler.fit_transform(tr.values)
     va_arr = scaler.transform(va.values)
     return pd.DataFrame(tr_arr, columns=cols), pd.DataFrame(va_arr, columns=cols)
+
+
+# ── Freestyle (opt-in, disabled by default) ───────────────────────────────────
+#
+# Guardrails applied in layers:
+#   1. Pattern blocklist  — catches obvious attacks at the source string level
+#   2. Restricted globals — exec sees only np, pd, and a safe builtin whitelist
+#   3. Post-exec checks   — row count, dtype, NaN/inf validation
+#
+# The same code snippet runs independently on df_train and df_val,
+# so it cannot observe which split it is operating on.
+
+_FREESTYLE_BLOCKED_PATTERNS = [
+    # imports
+    "import ",          # catches "import os", "from os import ..."
+    "__import__",       # dynamic import
+    # code execution
+    "eval(",
+    "exec(",
+    "compile(",
+    # file / network / process
+    "open(",
+    "socket",
+    "urllib",
+    "requests",
+    "subprocess",
+    "shutil",
+    # introspection / escape hatches
+    "globals(",
+    "locals(",
+    "vars(",
+    "dir(",
+    "getattr(",
+    "setattr(",
+    "delattr(",
+    "hasattr(",
+    # dunder attribute access (e.g. obj.__class__.__subclasses__())
+    ".__",
+    "['__",
+    '["__',
+    # process control
+    "exit(",
+    "quit(",
+    "breakpoint(",
+    "input(",
+]
+
+# Whitelist of builtins available inside freestyle code.
+_FREESTYLE_SAFE_BUILTINS: dict = {
+    name: getattr(_builtins, name)
+    for name in [
+        "abs", "bool", "dict", "enumerate", "filter", "float",
+        "int", "isinstance", "len", "list", "map", "max", "min",
+        "range", "round", "set", "sorted", "str", "sum", "tuple",
+        "zip", "print",                     # print is fine for debugging
+        "True", "False", "None",
+        "ValueError", "TypeError",          # allow raising these
+    ]
+    if hasattr(_builtins, name)
+}
+
+_FREESTYLE_MAX_LINES = 15
+_FREESTYLE_MAX_CHARS = 600
+
+
+def check_freestyle_safety(code: str, name: str = "freestyle") -> None:
+    """Raise ValueError if the code contains any blocked pattern.
+    Called both from agent.py (before the pipeline is committed) and
+    from _op_freestyle (defense-in-depth at execution time).
+    """
+    if not code or not code.strip():
+        raise ValueError(f"freestyle '{name}': 'code' is empty")
+
+    n_lines = len(code.splitlines())
+    if n_lines > _FREESTYLE_MAX_LINES:
+        raise ValueError(
+            f"freestyle '{name}': code is {n_lines} lines; "
+            f"max allowed is {_FREESTYLE_MAX_LINES}"
+        )
+    if len(code) > _FREESTYLE_MAX_CHARS:
+        raise ValueError(
+            f"freestyle '{name}': code is {len(code)} chars; "
+            f"max allowed is {_FREESTYLE_MAX_CHARS}"
+        )
+
+    for pattern in _FREESTYLE_BLOCKED_PATTERNS:
+        if pattern in code:
+            raise ValueError(
+                f"freestyle '{name}': blocked pattern {pattern!r} found in code"
+            )
+
+
+def _op_freestyle(step, tr, va):
+    """Execute a short Python snippet to create or transform features.
+
+    The snippet runs independently on df_train and df_val (same code, no
+    shared state), so it cannot observe which split it is processing.
+
+    params:
+      code (str) — Python snippet; `df` is the current DataFrame,
+                   `np` and `pd` are available.  Modify `df` in-place
+                   or reassign columns.  Do NOT filter rows.
+      name (str) — human-readable label for this step (used in logs)
+
+    Example:
+      {"op": "freestyle",
+       "code": "df['family_size'] = df['sibsp'] + df['parch'] + 1",
+       "name": "family size"}
+    """
+    code = step.get("code", "")
+    name = step.get("name", "freestyle")
+
+    # Layer 1: pattern check (defense-in-depth — agent also checks before commit)
+    check_freestyle_safety(code, name)
+
+    def _exec_on(df: pd.DataFrame) -> pd.DataFrame:
+        # Layer 2: restricted execution environment
+        globs = {"__builtins__": _FREESTYLE_SAFE_BUILTINS, "np": np, "pd": pd}
+        locs  = {"df": df.copy()}
+        exec(code, globs, locs)  # noqa: S102
+        return locs["df"]
+
+    tr_out = _exec_on(tr)
+    va_out = _exec_on(va)
+
+    # Layer 3: post-execution checks
+    if len(tr_out) != len(tr):
+        raise ValueError(
+            f"freestyle '{name}': row count changed "
+            f"(train {len(tr)} → {len(tr_out)}). Code must not filter rows."
+        )
+    if len(va_out) != len(va):
+        raise ValueError(
+            f"freestyle '{name}': row count changed "
+            f"(val {len(va)} → {len(va_out)}). Code must not filter rows."
+        )
+
+    bad_cols = [c for c in tr_out.columns if tr_out[c].dtype == object]
+    if bad_cols:
+        raise ValueError(
+            f"freestyle '{name}': all columns must be numeric; "
+            f"got object dtype in: {bad_cols}"
+        )
+
+    # Replace inf/NaN silently (common in ratio-like expressions)
+    tr_out = tr_out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    va_out = va_out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return tr_out, va_out

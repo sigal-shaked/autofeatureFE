@@ -71,11 +71,36 @@ REGEN_PROFILE        = os.environ.get("REGEN_PROFILE", "false").lower() == "true
 TOPK             = int(float(os.environ.get("TOPK", "5")))
 COMPLEXITY_ALPHA = float(os.environ.get("COMPLEXITY_ALPHA", "0.005"))
 
+# Freestyle op — disabled by default.  When enabled the LLM may propose a
+# short Python snippet as an operation.  The code is safety-checked before
+# it is committed or executed.  See operations.py for the full guardrail list.
+#   ALLOW_FREESTYLE=true   → enable
+ALLOW_FREESTYLE = os.environ.get("ALLOW_FREESTYLE", "false").lower() == "true"
+
 RESULTS_FILE = Path("results.tsv")
 PIPELINE_FILE = Path("pipeline.json")
 POOL_FILE     = Path("topk_pool.json")   # not tracked by git
 
 # ─── Operation reference (shown verbatim to the LLM) ─────────────────────────
+
+_FREESTYLE_REFERENCE = """
+── Freestyle (use ONLY when no built-in op can express the idea) ─────────────
+{"op": "freestyle",
+ "code": "df['family_size'] = df['sibsp'] + df['parch'] + 1",
+ "name": "family size"}
+
+Rules — strictly enforced; violations abort the run:
+• `df` is the current pandas DataFrame; modify it in-place or assign columns.
+• `np` (numpy) and `pd` (pandas) are the only available names. No imports.
+• The SAME code runs independently on train and val — do NOT use row indices,
+  row counts, or any value that differs between the two splits.
+• Do NOT filter or reorder rows (row count must stay the same).
+• All resulting columns must be numeric (float/int). No object/string columns.
+• Max 15 lines / 600 characters.
+• Blocked: import, eval, exec, open, globals, getattr, .__ and similar.
+• Prefer built-in ops when possible — freestyle counts toward the complexity penalty.
+"""
+
 
 def _build_operations_reference(feature_names: list[str]) -> str:
     names_str = ", ".join(feature_names)
@@ -128,7 +153,7 @@ Original features: {names_str}
 {"op": "scale", "method": "robust"}     // RobustScaler (percentile-based)
 {"op": "scale", "method": "minmax"}     // MinMaxScaler → [0,1]
 {"op": "scale", "method": "quantile"}   // QuantileTransformer → N(0,1)
-"""
+""" + (_FREESTYLE_REFERENCE if ALLOW_FREESTYLE else "")
 
 
 def _build_system_prompt(task_cfg: dict, feature_names: list[str]) -> str:
@@ -298,12 +323,32 @@ def validate_pipeline(config: dict) -> tuple[bool, str]:
     steps = config["steps"]
     if not isinstance(steps, list) or not steps:
         return False, "'steps' must be a non-empty list"
+
+    allowed = _ALLOWED_OPS | ({"freestyle"} if ALLOW_FREESTYLE else set())
+
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
             return False, f"Step {i} is not an object"
         op = step.get("op")
-        if op not in _ALLOWED_OPS:
+        if op not in allowed:
+            if op == "freestyle":
+                return False, (
+                    f"Step {i}: 'freestyle' op requires ALLOW_FREESTYLE=true "
+                    "(set env var or pass allow_freestyle=True to run())"
+                )
             return False, f"Step {i}: unknown op {op!r}"
+        if op == "freestyle":
+            if "code" not in step:
+                return False, f"Step {i}: freestyle step missing 'code' field"
+            if "name" not in step:
+                return False, f"Step {i}: freestyle step missing 'name' field"
+            # Safety check before the code ever touches disk or gets committed
+            from operations import check_freestyle_safety
+            try:
+                check_freestyle_safety(step["code"], step["name"])
+            except ValueError as e:
+                return False, f"Step {i}: {e}"
+
     if steps[-1].get("op") != "scale":
         return False, "Last step must be a 'scale' operation"
     if "description" not in config:
@@ -715,6 +760,11 @@ def main(n_iterations: int | None = None) -> None:
     )
     print(f"History          : {history_desc}")
     print(f"Data profile     : {'enabled' if INCLUDE_DATA_PROFILE else 'disabled'}")
+    print(f"Freestyle ops    : {'ENABLED ⚠️  (LLM code will be exec-d)' if ALLOW_FREESTYLE else 'disabled'}")
+    if ALLOW_FREESTYLE:
+        print("  ⚠️  WARNING: freestyle mode executes LLM-generated Python code.")
+        print("     Safety checks are applied but cannot guarantee full sandboxing.")
+        print("     Only enable this on trusted, non-production machines.")
     print()
 
     branch       = git_setup_branch()
@@ -895,6 +945,7 @@ def run(
     include_data_profile: bool | None = None,
     regen_profile: bool | None = None,
     train_timeout: int | None = None,
+    allow_freestyle: bool | None = None,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
     llm_provider: str | None = None,
@@ -919,6 +970,9 @@ def run(
     include_data_profile: Whether to generate/use the one-time data profile.
     regen_profile   : Force regeneration of the data profile even if cached.
     train_timeout   : Seconds before a training run is killed (default 120).
+    allow_freestyle : Allow the LLM to propose short Python snippets as ops.
+                      Disabled by default. Code is safety-checked before exec.
+                      Only enable on trusted machines — see operations.py for guardrails.
     anthropic_api_key: Anthropic API key (overrides ANTHROPIC_API_KEY env var).
     openai_api_key  : OpenAI API key (overrides OPENAI_API_KEY env var).
     llm_provider    : "anthropic" or "openai" (auto-detected if not set).
@@ -926,7 +980,7 @@ def run(
     working_dir     : Path to the repo directory (defaults to current directory).
     """
     global TOPK, COMPLEXITY_ALPHA, INCLUDE_HISTORY, HISTORY_SIZE, HISTORY_FILTER
-    global INCLUDE_DATA_PROFILE, REGEN_PROFILE, TRAIN_TIMEOUT
+    global INCLUDE_DATA_PROFILE, REGEN_PROFILE, TRAIN_TIMEOUT, ALLOW_FREESTYLE
     global TASK_FILE, PIPELINE_FILE, POOL_FILE, RESULTS_FILE
 
     if working_dir is not None:
@@ -945,6 +999,7 @@ def run(
     if include_data_profile is not None: INCLUDE_DATA_PROFILE = include_data_profile
     if regen_profile    is not None: REGEN_PROFILE     = regen_profile
     if train_timeout    is not None: TRAIN_TIMEOUT     = train_timeout
+    if allow_freestyle  is not None: ALLOW_FREESTYLE   = allow_freestyle
 
     if anthropic_api_key: os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
     if openai_api_key:    os.environ["OPENAI_API_KEY"]    = openai_api_key
