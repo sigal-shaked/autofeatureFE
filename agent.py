@@ -60,6 +60,14 @@ HISTORY_SIZE     = int(os.environ.get("HISTORY_SIZE", "20"))   # 0 = unlimited
 HISTORY_FILTER   = os.environ.get("HISTORY_FILTER", "all")     # "all" | "kept"
 TRAIN_TIMEOUT    = 120   # seconds
 
+# Data profile — one-time LLM analysis of the raw dataset, optionally injected
+# into every iteration prompt.
+#   DATA_PROFILE=false      → disable entirely
+#   DATA_PROFILE=true       → generate on first run, cache in data_profile_<dataset>.md
+#   REGEN_PROFILE=true      → force regeneration even if cache exists
+INCLUDE_DATA_PROFILE = os.environ.get("DATA_PROFILE", "true").lower() != "false"
+REGEN_PROFILE        = os.environ.get("REGEN_PROFILE", "false").lower() == "true"
+
 TOPK             = int(float(os.environ.get("TOPK", "5")))
 COMPLEXITY_ALPHA = float(os.environ.get("COMPLEXITY_ALPHA", "0.005"))
 
@@ -524,17 +532,149 @@ def format_history(records: list[Record], metric_name: str) -> str:
     return "\n".join(rows)
 
 
+# ─── Data profiler ───────────────────────────────────────────────────────────
+
+_PROFILE_SYSTEM = """\
+You are a data scientist specialising in feature engineering for tabular ML.
+
+Given statistical summaries of a dataset, produce CONCISE, actionable insights
+for a feature engineering agent.  Cover:
+1. Which features are skewed and would benefit from log / sqrt / clip transforms.
+2. Which feature pairs are likely to form useful ratios, differences, or products.
+3. Which features correlate most strongly with the target.
+4. Any high inter-feature correlations that suggest redundancy or interaction potential.
+5. Any other dataset-specific quirks that should guide feature construction.
+
+Be specific — use the actual feature names.  Keep the response under 500 words.
+Use bullet points.  Do NOT suggest model changes; focus only on the features.
+"""
+
+
+def _compute_raw_stats(task_cfg: dict, feature_names: list[str]) -> str:
+    """Return a statistical summary of the raw training data as a formatted string."""
+    import numpy as np
+    from sklearn.model_selection import train_test_split
+    from prepare import _load_dataset
+
+    df, y = _load_dataset(task_cfg["dataset"])
+    idx = np.arange(len(df))
+    idx_train, _ = train_test_split(idx, test_size=0.2, random_state=42)
+    df_tr = df.iloc[idx_train].reset_index(drop=True)
+    y_tr  = y[idx_train]
+
+    lines = [
+        f"DATASET  : {task_cfg['dataset']}",
+        f"TASK     : {task_cfg['task']}",
+        f"METRIC   : {task_cfg['metric']}",
+        f"SAMPLES  : {len(df)} total  ({len(df_tr)} train  {len(df)-len(df_tr)} val)",
+        f"FEATURES : {len(feature_names)}",
+        "",
+        f"{'Feature':<22} {'mean':>9} {'std':>9} {'skew':>6} {'min':>9} {'p25':>9} {'p50':>9} {'p75':>9} {'max':>9}",
+        "-" * 100,
+    ]
+    for col in feature_names:
+        v = df_tr[col].values
+        skew = float(df_tr[col].skew())
+        p25, p50, p75 = float(df_tr[col].quantile(0.25)), float(df_tr[col].median()), float(df_tr[col].quantile(0.75))
+        lines.append(
+            f"{col:<22} {v.mean():>9.3f} {v.std():>9.3f} {skew:>6.2f}"
+            f" {v.min():>9.3f} {p25:>9.3f} {p50:>9.3f} {p75:>9.3f} {v.max():>9.3f}"
+        )
+
+    lines += ["", "CORRELATION WITH TARGET (Pearson r):"]
+    corrs = sorted(
+        [(col, float(df_tr[col].corr(import_series(y_tr, df_tr)))) for col in feature_names],
+        key=lambda x: abs(x[1]), reverse=True,
+    )
+    for col, r in corrs:
+        lines.append(f"  {col:<22}: {r:+.4f}")
+
+    lines += ["", "INTER-FEATURE CORRELATIONS (|r| ≥ 0.4):"]
+    corr_mat = df_tr.corr()
+    pairs = [
+        (a, b, float(corr_mat.loc[a, b]))
+        for i, a in enumerate(feature_names)
+        for b in feature_names[i + 1:]
+        if abs(corr_mat.loc[a, b]) >= 0.4
+    ]
+    pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+    if pairs:
+        for a, b, r in pairs:
+            lines.append(f"  {a} ↔ {b}: {r:+.4f}")
+    else:
+        lines.append("  (none above threshold)")
+
+    if task_cfg["task"] == "regression":
+        lines += ["", f"TARGET: mean={y_tr.mean():.4f}  std={y_tr.std():.4f}  skew={float(import_series(y_tr, df_tr).skew()):.2f}  min={y_tr.min():.4f}  max={y_tr.max():.4f}"]
+    else:
+        import numpy as np
+        classes, counts = np.unique(y_tr, return_counts=True)
+        lines += ["", "TARGET CLASS DISTRIBUTION:"]
+        for cls, cnt in zip(classes, counts):
+            lines.append(f"  class {cls}: {cnt} ({100*cnt/len(y_tr):.1f}%)")
+
+    return "\n".join(lines)
+
+
+def import_series(arr, ref_df):
+    """Wrap a numpy array as a pandas Series aligned with ref_df's index."""
+    import pandas as pd
+    return pd.Series(arr, index=ref_df.index)
+
+
+def load_or_generate_profile(
+    task_cfg: dict,
+    feature_names: list[str],
+    provider: str,
+    model: str,
+) -> str | None:
+    """Return the data profile string, generating and caching it if needed."""
+    if not INCLUDE_DATA_PROFILE:
+        return None
+
+    profile_path = Path(f"data_profile_{task_cfg['dataset']}.md")
+
+    if profile_path.exists() and not REGEN_PROFILE:
+        print(f"Data profile     : loaded from {profile_path}")
+        return profile_path.read_text()
+
+    print("Generating data profile (one-time LLM call)...")
+    stats = _compute_raw_stats(task_cfg, feature_names)
+
+    messages = [{"role": "user", "content": f"Analyse this dataset for feature engineering:\n\n{stats}"}]
+    insights = call_llm(messages, provider, model, _PROFILE_SYSTEM)
+
+    # Cache: store both stats and insights so the file is human-readable
+    profile_path.write_text(
+        f"# Data Profile: {task_cfg['dataset']}\n"
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}\n\n"
+        f"## Raw Statistics\n```\n{stats}\n```\n\n"
+        f"## LLM Insights\n{insights}\n"
+    )
+    print(f"Data profile     : saved to {profile_path}")
+    return insights   # only the insights go into the prompt
+
+
+# ─── Prompt construction ──────────────────────────────────────────────────────
+
 def build_messages(
     pool: list[PoolEntry],
     base: PoolEntry,
     records: list[Record],
     task_cfg: dict,
+    data_profile: str | None = None,
 ) -> list[dict]:
     metric_name = task_cfg["metric"]
     base_json   = json.dumps({"description": base.description, "steps": base.steps}, indent=2)
-    history_section = ""
-    if INCLUDE_HISTORY:
-        history_section = f"\nExperiment history (most recent last):\n{format_history(records, metric_name)}\n"
+
+    profile_section = (
+        f"\nDATA INSIGHTS (one-time analysis of the raw dataset):\n{data_profile}\n"
+        if data_profile else ""
+    )
+    history_section = (
+        f"\nExperiment history (most recent last):\n{format_history(records, metric_name)}\n"
+        if INCLUDE_HISTORY else ""
+    )
 
     content = f"""\
 Top-{TOPK} pipeline pool (rank 1 = best score):
@@ -544,7 +684,7 @@ Base pipeline for this iteration: rank {base.rank} — "{base.description}"
 ```json
 {base_json}
 ```
-{history_section}
+{profile_section}{history_section}
 Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the complete updated pipeline.
 """
     return [{"role": "user", "content": content}]
@@ -574,10 +714,12 @@ def main() -> None:
         else f"{HISTORY_FILTER}, last {'∞' if HISTORY_SIZE == 0 else HISTORY_SIZE}"
     )
     print(f"History          : {history_desc}")
+    print(f"Data profile     : {'enabled' if INCLUDE_DATA_PROFILE else 'disabled'}")
     print()
 
-    branch = git_setup_branch()
+    branch       = git_setup_branch()
     print(f"Branch           : {branch}")
+    data_profile = load_or_generate_profile(task_cfg, feature_names, provider, model)
 
     init_results()
     records  = load_results()
@@ -634,7 +776,7 @@ def main() -> None:
         base_config = {"description": base.description, "steps": base.steps}
         PIPELINE_FILE.write_text(json.dumps(base_config, indent=2) + "\n")
 
-        messages = build_messages(pool, base, records, task_cfg)
+        messages = build_messages(pool, base, records, task_cfg, data_profile)
 
         # ── LLM call ──────────────────────────────────────────────────────────
         new_config = None
