@@ -9,6 +9,7 @@ Supported datasets
   california_housing  — regression,      8 features
   breast_cancer       — classification,  30 features
   wine                — classification,  13 features (3 classes)
+  csv                 — any tabular CSV; set csv_path + target_column in task.json
 """
 
 import json
@@ -47,10 +48,17 @@ def _load_dataset(dataset: str) -> tuple[pd.DataFrame, np.ndarray]:
         df = pd.DataFrame(raw.data, columns=raw.feature_names)
         y  = raw.target.astype(np.int32)
 
+    elif dataset == "csv":
+        csv_path   = Path(__file__).parent / task_cfg["csv_path"]
+        target_col = task_cfg["target_column"]
+        df_full    = pd.read_csv(csv_path)
+        y          = df_full[target_col].values.astype(np.float32)
+        df         = df_full.drop(columns=[target_col])
+
     else:
         raise ValueError(
             f"Unknown dataset {dataset!r}. "
-            "Supported: california_housing, breast_cancer, wine"
+            "Supported: california_housing, breast_cancer, wine, csv"
         )
 
     return df, y
@@ -88,7 +96,11 @@ def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 def get_feature_names() -> list[str]:
     """Return original feature names for the configured dataset (used by agent)."""
     task_cfg = json.loads(TASK_FILE.read_text())
-    df, _    = _load_dataset(task_cfg["dataset"])
+    if task_cfg["dataset"] == "csv":
+        csv_path   = Path(__file__).parent / task_cfg["csv_path"]
+        target_col = task_cfg["target_column"]
+        return pd.read_csv(csv_path).drop(columns=[target_col]).columns.tolist()
+    df, _ = _load_dataset(task_cfg["dataset"])
     return df.columns.tolist()
 
 
