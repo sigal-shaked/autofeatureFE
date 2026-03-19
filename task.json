@@ -1,0 +1,5 @@
+{
+  "task": "regression",
+  "dataset": "california_housing",
+  "metric": "rmse"
+}

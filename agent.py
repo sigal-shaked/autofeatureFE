@@ -41,6 +41,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
+TASK_FILE = Path("task.json")
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
@@ -59,14 +61,16 @@ POOL_FILE     = Path("topk_pool.json")   # not tracked by git
 
 # ─── Operation reference (shown verbatim to the LLM) ─────────────────────────
 
-OPERATIONS_REFERENCE = """\
+def _build_operations_reference(feature_names: list[str]) -> str:
+    names_str = ", ".join(feature_names)
+    return f"""\
 AVAILABLE OPERATIONS
 ====================
 All operations reference features by column name.  Binary / multi-feature ops
 create NEW columns; originals are kept unless you add a "drop" step.
 Steps are applied left-to-right; later steps can reference columns created earlier.
 
-Original features: MedInc, HouseAge, AveRooms, AveBedrms, Population, AveOccup, Latitude, Longitude
+Original features: {names_str}
 
 ── Unary transforms (modify a feature in-place) ─────────────────────────────
 {"op": "log1p",           "features": ["MedInc"]}
@@ -110,23 +114,67 @@ Original features: MedInc, HouseAge, AveRooms, AveBedrms, Population, AveOccup, 
 {"op": "scale", "method": "quantile"}   // QuantileTransformer → N(0,1)
 """
 
-# ─── System prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = f"""\
-You are an expert data scientist specializing in feature engineering for tabular regression.
+def _build_system_prompt(task_cfg: dict, feature_names: list[str]) -> str:
+    task        = task_cfg["task"]    # regression | classification
+    metric_name = task_cfg["metric"]  # rmse | auc | logloss
+    dataset     = task_cfg["dataset"]
+
+    ops_ref = _build_operations_reference(feature_names)
+
+    n0 = len(feature_names)
+    n1 = max(n0 * 4, 30)
+
+    if metric_name == "rmse":
+        metric_desc  = "val_rmse (lower is better)"
+        primary_desc = "primary = val_rmse"
+        base_primary = 0.430
+    elif metric_name == "auc":
+        metric_desc  = "val_auc (higher is better)"
+        primary_desc = "primary = 1 − val_auc   ← so lower primary is always better"
+        base_primary = 1 - 0.970
+    else:  # logloss
+        metric_desc  = "val_logloss (lower is better)"
+        primary_desc = "primary = val_logloss"
+        base_primary = 0.15
+
+    score0 = base_primary + COMPLEXITY_ALPHA * math.log(n0)
+    thresh = base_primary - COMPLEXITY_ALPHA * (math.log(n1) - math.log(n0))
+
+    if task == "regression":
+        strategy = """\
+- Ratio features between related columns are often the strongest signal.
+- Log-transform skewed features before using them in ratios.
+- Geographic features (clusters, distance to city centres) capture spatial effects.
+- Polynomial degree-2 on a SMALL set of strong predictors adds useful interactions.
+- Clip outliers before log/ratio ops to avoid extreme values."""
+    else:
+        strategy = """\
+- Ratio features between related columns often separate classes well.
+- Log-transform skewed or heavy-tailed features to reduce their dynamic range.
+- Polynomial degree-2 on a small set of discriminative features adds interactions.
+- Dropping redundant or noisy features can help the classifier generalise.
+- "robust" or "quantile" scaling is useful when features have very different scales."""
+
+    return f"""\
+You are an expert data scientist specialising in feature engineering for tabular {task}.
 
 TASK
 ====
-Improve a feature engineering pipeline to minimise the SCORE on California Housing:
+Dataset  : {dataset}
+ML task  : {task}
+Metric   : {metric_desc}
 
-  score = val_rmse + {COMPLEXITY_ALPHA} × ln(n_features)
+Improve the feature engineering pipeline to minimise the SCORE:
 
-The score penalises unnecessary feature bloat.  A pipeline with 8 features that
-achieves val_rmse=0.430 scores {0.430 + COMPLEXITY_ALPHA*math.log(8):.4f}, while one with
-50 features needs val_rmse < {0.430 - COMPLEXITY_ALPHA*(math.log(50)-math.log(8)):.4f} to beat it.
+  {primary_desc}
+  score = primary + {COMPLEXITY_ALPHA} × ln(n_features)
+
+The complexity term penalises feature bloat.  With {n0} features scoring {score0:.4f},
+a {n1}-feature pipeline needs primary < {thresh:.4f} to beat it.
 The ML model (XGBoost) and ALL its hyperparameters are FIXED.
 
-{OPERATIONS_REFERENCE}
+{ops_ref}
 
 PIPELINE FORMAT
 ===============
@@ -152,15 +200,9 @@ RULES
 
 STRATEGY TIPS
 =============
-- Ratio features (AveRooms/AveBedrms, Population/AveOccup) are often the strongest.
-- Log-transform skewed features before using them in ratios.
-- Geographic clusters on (Lat, Lon) capture location signal well.
-- Distance to multiple city centres encodes urban-proximity gradient.
-- Polynomial degree-2 on a SMALL set of strong predictors adds useful interactions.
-- Clip outliers before log/ratio ops to avoid extreme values.
-- Dropping weak features can improve generalisation AND lower the complexity penalty.
-- Prefer simple pipelines: a small RMSE gain that adds many features may not improve score.
-- "robust" scaling is more stable when outliers remain after clipping.
+{strategy}
+- Dropping weak features improves generalisation AND lowers the complexity penalty.
+- Prefer simple pipelines: a small metric gain with many extra features may not improve score.
 
 Think step by step, then output only the JSON.
 """
@@ -183,20 +225,20 @@ def detect_provider() -> tuple[str, str]:
     return "anthropic", os.environ.get("LLM_MODEL", DEFAULT_ANTHROPIC_MODEL)
 
 
-def call_llm(messages: list[dict], provider: str, model: str) -> str:
+def call_llm(messages: list[dict], provider: str, model: str, system_prompt: str) -> str:
     if provider == "anthropic":
         import anthropic
         client = anthropic.Anthropic()
         resp = client.messages.create(
             model=model, max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT, messages=messages,
+            system=system_prompt, messages=messages,
         )
         return resp.content[0].text
     elif provider == "openai":
         from openai import OpenAI
         resp = OpenAI().chat.completions.create(
             model=model, max_tokens=MAX_TOKENS,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
         )
         return resp.choices[0].message.content
     raise ValueError(f"Unknown provider: {provider}")
@@ -256,9 +298,9 @@ def validate_pipeline(config: dict) -> tuple[bool, str]:
 # ─── Scoring ──────────────────────────────────────────────────────────────────
 
 
-def compute_score(val_rmse: float, n_features: int) -> float:
-    """score = val_rmse + COMPLEXITY_ALPHA * ln(n_features)"""
-    return val_rmse + COMPLEXITY_ALPHA * math.log(max(n_features, 1))
+def compute_score(primary: float, n_features: int) -> float:
+    """score = primary_metric + COMPLEXITY_ALPHA * ln(n_features)  (always minimised)"""
+    return primary + COMPLEXITY_ALPHA * math.log(max(n_features, 1))
 
 
 # ─── Top-k pool ───────────────────────────────────────────────────────────────
@@ -337,10 +379,19 @@ def git_revert_last() -> None:
 
 @dataclass
 class RunResult:
-    val_rmse: float | None
+    val_score: float | None    # raw metric value (rmse, auc, or logloss)
+    metric_name: str | None    # "rmse" | "auc" | "logloss"
     n_features: int | None
     crashed: bool
     output: str
+
+    def primary(self) -> float | None:
+        """Normalised metric where lower is always better."""
+        if self.val_score is None:
+            return None
+        if self.metric_name == "auc":
+            return 1.0 - self.val_score
+        return self.val_score  # rmse and logloss are already lower-is-better
 
 
 def run_train() -> RunResult:
@@ -350,20 +401,26 @@ def run_train() -> RunResult:
             capture_output=True, text=True, timeout=TRAIN_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return RunResult(None, None, True, "TIMEOUT")
+        return RunResult(None, None, None, True, "TIMEOUT")
 
     out = proc.stdout + proc.stderr
     crashed = proc.returncode != 0
-    val_rmse = n_features = None
-    m = re.search(r"val_rmse\s*:\s*([0-9.]+)", out)
+    val_score = n_features = None
+    metric_name = None
+
+    m = re.search(r"val_score\s*:\s*([0-9.]+)", out)
     if m:
-        val_rmse = float(m.group(1))
+        val_score = float(m.group(1))
+    m = re.search(r"metric_name\s*:\s*(\w+)", out)
+    if m:
+        metric_name = m.group(1)
     m = re.search(r"n_features\s*:\s*([0-9]+)", out)
     if m:
         n_features = int(m.group(1))
-    if val_rmse is None:
+    if val_score is None:
         crashed = True
-    return RunResult(val_rmse, n_features, crashed, out)
+
+    return RunResult(val_score, metric_name, n_features, crashed, out)
 
 
 # ─── Results log ──────────────────────────────────────────────────────────────
@@ -374,10 +431,11 @@ class Record:
     timestamp: str
     experiment: int
     description: str
-    val_rmse: float | None
+    val_score: float | None    # raw metric (rmse / auc / logloss)
+    metric_name: str | None
     n_features: int | None
-    score: float | None
-    pool_rank: int | None    # rank in pool after this experiment (None if not in pool)
+    score: float | None        # composite score (primary + complexity penalty)
+    pool_rank: int | None      # rank in pool after this experiment (None if not in pool)
     kept: bool
     crashed: bool
 
@@ -385,7 +443,7 @@ class Record:
 def init_results() -> None:
     if not RESULTS_FILE.exists():
         RESULTS_FILE.write_text(
-            "timestamp\texperiment\tdescription\tval_rmse\tn_features\tscore\tpool_rank\tkept\tcrashed\n"
+            "timestamp\texperiment\tdescription\tval_score\tmetric\tn_features\tscore\tpool_rank\tkept\tcrashed\n"
         )
 
 
@@ -395,19 +453,20 @@ def load_results() -> list[Record]:
     records = []
     for line in RESULTS_FILE.read_text().splitlines()[1:]:
         parts = line.split("\t")
-        if len(parts) < 9:
+        if len(parts) < 10:
             continue
         try:
             records.append(Record(
                 timestamp=parts[0],
                 experiment=int(parts[1]),
                 description=parts[2],
-                val_rmse=float(parts[3]) if parts[3] not in ("CRASH", "") else None,
-                n_features=int(parts[4]) if parts[4] else None,
-                score=float(parts[5]) if parts[5] not in ("CRASH", "") else None,
-                pool_rank=int(parts[6]) if parts[6] else None,
-                kept=parts[7] == "yes",
-                crashed=parts[8] == "yes",
+                val_score=float(parts[3]) if parts[3] not in ("CRASH", "") else None,
+                metric_name=parts[4] if parts[4] else None,
+                n_features=int(parts[5]) if parts[5] else None,
+                score=float(parts[6]) if parts[6] not in ("CRASH", "") else None,
+                pool_rank=int(parts[7]) if parts[7] else None,
+                kept=parts[8] == "yes",
+                crashed=parts[9] == "yes",
             ))
         except (ValueError, IndexError):
             pass
@@ -415,13 +474,14 @@ def load_results() -> list[Record]:
 
 
 def append_result(r: Record) -> None:
-    rmse_s  = f"{r.val_rmse:.6f}" if r.val_rmse is not None else "CRASH"
-    score_s = f"{r.score:.6f}"    if r.score     is not None else "CRASH"
-    rank_s  = str(r.pool_rank)    if r.pool_rank is not None else ""
+    score_s = f"{r.val_score:.6f}" if r.val_score is not None else "CRASH"
+    comp_s  = f"{r.score:.6f}"     if r.score     is not None else "CRASH"
+    rank_s  = str(r.pool_rank)     if r.pool_rank is not None else ""
     with RESULTS_FILE.open("a") as f:
         f.write(
             f"{r.timestamp}\t{r.experiment}\t{r.description}\t"
-            f"{rmse_s}\t{r.n_features or ''}\t{score_s}\t{rank_s}\t"
+            f"{score_s}\t{r.metric_name or ''}\t{r.n_features or ''}\t"
+            f"{comp_s}\t{rank_s}\t"
             f"{'yes' if r.kept else 'no'}\t{'yes' if r.crashed else 'no'}\n"
         )
 
@@ -429,18 +489,19 @@ def append_result(r: Record) -> None:
 # ─── Prompt construction ──────────────────────────────────────────────────────
 
 
-def format_history(records: list[Record]) -> str:
+def format_history(records: list[Record], metric_name: str) -> str:
     if not records:
         return "(no experiments yet)"
     recent = records[-HISTORY_SIZE:]
-    rows = ["#exp | score  | val_rmse | n_feat | pool | description"]
-    rows.append("---- | ------ | -------- | ------ | ---- | -----------")
+    col = metric_name or "metric"
+    rows = [f"#exp | score  | {col:9s} | n_feat | pool | description"]
+    rows.append(f"---- | ------ | {'-'*9} | ------ | ---- | -----------")
     for r in recent:
-        rmse_s  = f"{r.val_rmse:.6f}" if r.val_rmse else "CRASH   "
-        score_s = f"{r.score:.4f}"    if r.score    else "CRASH "
-        feat_s  = str(r.n_features)   if r.n_features else "?"
-        rank_s  = f"#{r.pool_rank}"   if r.pool_rank else "  -"
-        rows.append(f"{r.experiment:4d} | {score_s} | {rmse_s} | {feat_s:6s} | {rank_s:4s} | {r.description}")
+        raw_s   = f"{r.val_score:.6f}" if r.val_score is not None else "CRASH   "
+        score_s = f"{r.score:.4f}"     if r.score     is not None else "CRASH "
+        feat_s  = str(r.n_features)    if r.n_features else "?"
+        rank_s  = f"#{r.pool_rank}"    if r.pool_rank  else "  -"
+        rows.append(f"{r.experiment:4d} | {score_s} | {raw_s} | {feat_s:6s} | {rank_s:4s} | {r.description}")
     return "\n".join(rows)
 
 
@@ -448,16 +509,11 @@ def build_messages(
     pool: list[PoolEntry],
     base: PoolEntry,
     records: list[Record],
+    task_cfg: dict,
 ) -> list[dict]:
-    base_json = json.dumps({"description": base.description, "steps": base.steps}, indent=2)
-    alpha_note = (
-        f"score = val_rmse + {COMPLEXITY_ALPHA} × ln(n_features)"
-        if COMPLEXITY_ALPHA > 0
-        else "score = val_rmse  (no complexity penalty)"
-    )
+    metric_name = task_cfg["metric"]
+    base_json   = json.dumps({"description": base.description, "steps": base.steps}, indent=2)
     content = f"""\
-SCORING: {alpha_note}
-
 Top-{TOPK} pipeline pool (rank 1 = best score):
 {format_pool(pool)}
 
@@ -467,7 +523,7 @@ Base pipeline for this iteration: rank {base.rank} — "{base.description}"
 ```
 
 Experiment history (most recent last):
-{format_history(records)}
+{format_history(records, metric_name)}
 
 Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the complete updated pipeline.
 """
@@ -479,8 +535,18 @@ Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the comple
 
 def main() -> None:
     provider, model = detect_provider()
+
+    # Load task config and build prompt once (it's constant for the session)
+    task_cfg = json.loads(TASK_FILE.read_text())
+    from prepare import get_feature_names
+    feature_names = get_feature_names()
+    system_prompt = _build_system_prompt(task_cfg, feature_names)
+    metric_name   = task_cfg["metric"]
+
     print(f"Provider         : {provider}")
     print(f"Model            : {model}")
+    print(f"Task             : {task_cfg['task']} / {task_cfg['dataset']}")
+    print(f"Metric           : {metric_name}")
     print(f"Top-k            : {TOPK}")
     print(f"Complexity alpha : {COMPLEXITY_ALPHA}")
     print()
@@ -489,9 +555,9 @@ def main() -> None:
     print(f"Branch           : {branch}")
 
     init_results()
-    records = load_results()
-    pool = load_pool()
-    exp_n = len(records) + 1
+    records  = load_results()
+    pool     = load_pool()
+    exp_n    = len(records) + 1
     pool_idx = 0   # round-robin cursor
 
     # ── Baseline ──────────────────────────────────────────────────────────────
@@ -501,15 +567,20 @@ def main() -> None:
     if baseline.crashed:
         print("Baseline CRASHED:")
         print(baseline.output[-800:])
-        sys.exit("Fix pipeline.json before running the agent.")
+        sys.exit("Fix pipeline.json / task.json before running the agent.")
 
-    baseline_steps = json.loads(PIPELINE_FILE.read_text())["steps"]
-    baseline_score = compute_score(baseline.val_rmse, baseline.n_features)
-    print(f"  val_rmse={baseline.val_rmse:.6f}  n_features={baseline.n_features}  score={baseline_score:.4f}")
+    baseline_steps   = json.loads(PIPELINE_FILE.read_text())["steps"]
+    baseline_primary = baseline.primary()
+    baseline_score   = compute_score(baseline_primary, baseline.n_features)
+    print(
+        f"  {metric_name}={baseline.val_score:.6f}"
+        f"  n_features={baseline.n_features}"
+        f"  score={baseline_score:.4f}"
+    )
 
     baseline_entry = PoolEntry(
         rank=1, experiment=exp_n,
-        val_rmse=baseline.val_rmse, n_features=baseline.n_features,
+        val_rmse=baseline.val_score, n_features=baseline.n_features,
         score=baseline_score, description="baseline", steps=baseline_steps,
     )
     pool = update_pool(pool, baseline_entry, TOPK)
@@ -518,35 +589,34 @@ def main() -> None:
     append_result(Record(
         timestamp=datetime.now().isoformat(timespec="seconds"),
         experiment=exp_n, description="baseline",
-        val_rmse=baseline.val_rmse, n_features=baseline.n_features,
-        score=baseline_score, pool_rank=baseline_entry.rank,
-        kept=True, crashed=False,
+        val_score=baseline.val_score, metric_name=metric_name,
+        n_features=baseline.n_features, score=baseline_score,
+        pool_rank=baseline_entry.rank, kept=True, crashed=False,
     ))
     records = load_results()
     exp_n += 1
 
     # ── Agent loop ────────────────────────────────────────────────────────────
     while True:
-        # Select base via round-robin through pool
         base = pool[pool_idx % len(pool)]
         pool_idx += 1
 
         print()
         print(f"{'─'*60}")
-        print(f"Experiment #{exp_n}  |  pool best score={pool[0].score:.4f}  |  base=rank{base.rank} ({base.description})")
+        print(f"Experiment #{exp_n}  |  best score={pool[0].score:.4f}  |  base=rank{base.rank} ({base.description})")
 
-        # Write base pipeline to pipeline.json (LLM will see it as the starting point)
+        # Stage base pipeline so the LLM sees it as the starting point
         base_config = {"description": base.description, "steps": base.steps}
         PIPELINE_FILE.write_text(json.dumps(base_config, indent=2) + "\n")
 
-        messages = build_messages(pool, base, records)
+        messages = build_messages(pool, base, records, task_cfg)
 
         # ── LLM call ──────────────────────────────────────────────────────────
         new_config = None
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             print(f"  Calling {provider}/{model} (attempt {attempt})...")
             try:
-                response = call_llm(messages, provider, model)
+                response = call_llm(messages, provider, model, system_prompt)
             except Exception as e:
                 print(f"  API error: {e}")
                 time.sleep(5)
@@ -596,7 +666,8 @@ def main() -> None:
             append_result(Record(
                 timestamp=datetime.now().isoformat(timespec="seconds"),
                 experiment=exp_n, description=description,
-                val_rmse=None, n_features=None, score=None,
+                val_score=None, metric_name=metric_name,
+                n_features=None, score=None,
                 pool_rank=None, kept=False, crashed=True,
             ))
             records = load_results()
@@ -604,23 +675,24 @@ def main() -> None:
             continue
 
         # ── Score & pool update ───────────────────────────────────────────────
-        score = compute_score(result.val_rmse, result.n_features)
-        worst_pool_score = pool[-1].score if len(pool) >= TOPK else float("inf")
-        enters_pool = score < worst_pool_score or len(pool) < TOPK
+        primary     = result.primary()
+        score       = compute_score(primary, result.n_features)
+        worst_score = pool[-1].score if len(pool) >= TOPK else float("inf")
+        enters_pool = score < worst_score or len(pool) < TOPK
+        delta       = score - pool[0].score
+        sign        = "✓" if enters_pool else "✗"
 
-        delta_score = score - pool[0].score
-        sign = "✓" if enters_pool else "✗"
         print(
-            f"  {sign} val_rmse={result.val_rmse:.6f}  n_features={result.n_features}"
-            f"  score={score:.4f}  Δ{delta_score:+.4f}"
-            + (f"  → enters pool" if enters_pool else "")
+            f"  {sign} {metric_name}={result.val_score:.6f}"
+            f"  n_features={result.n_features}"
+            f"  score={score:.4f}  Δ{delta:+.4f}"
+            + ("  → enters pool" if enters_pool else "")
         )
 
         if enters_pool:
             new_entry = PoolEntry(
-                rank=0,   # will be set by update_pool
-                experiment=exp_n,
-                val_rmse=result.val_rmse, n_features=result.n_features,
+                rank=0, experiment=exp_n,
+                val_rmse=result.val_score, n_features=result.n_features,
                 score=score, description=description,
                 steps=new_config["steps"],
             )
@@ -635,9 +707,9 @@ def main() -> None:
         append_result(Record(
             timestamp=datetime.now().isoformat(timespec="seconds"),
             experiment=exp_n, description=description,
-            val_rmse=result.val_rmse, n_features=result.n_features,
-            score=score, pool_rank=pool_rank,
-            kept=enters_pool, crashed=False,
+            val_score=result.val_score, metric_name=metric_name,
+            n_features=result.n_features, score=score,
+            pool_rank=pool_rank, kept=enters_pool, crashed=False,
         ))
         records = load_results()
         exp_n += 1
