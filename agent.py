@@ -412,27 +412,16 @@ def format_pool(pool: list[PoolEntry]) -> str:
     return "\n".join(rows)
 
 
-# ─── Git helpers ──────────────────────────────────────────────────────────────
+# ─── Pipeline file helpers ────────────────────────────────────────────────────
 
 
-def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=check)
+def write_pipeline(config: dict) -> None:
+    PIPELINE_FILE.write_text(json.dumps(config, indent=2) + "\n")
 
 
-def git_setup_branch() -> str:
-    tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    branch = f"autofeature/{tag}"
-    git("checkout", "-b", branch)
-    return branch
-
-
-def git_commit(message: str) -> bool:
-    git("add", str(PIPELINE_FILE))
-    return git("commit", "-m", message, check=False).returncode == 0
-
-
-def git_revert_last() -> None:
-    git("reset", "--hard", "HEAD~1")
+def pipeline_changed(new_config: dict, base_config: dict) -> bool:
+    """Return True if the new pipeline differs from the base."""
+    return json.dumps(new_config, sort_keys=True) != json.dumps(base_config, sort_keys=True)
 
 
 # ─── Training ─────────────────────────────────────────────────────────────────
@@ -767,8 +756,6 @@ def main(n_iterations: int | None = None) -> None:
         print("     Only enable this on trusted, non-production machines.")
     print()
 
-    branch       = git_setup_branch()
-    print(f"Branch           : {branch}")
     data_profile = load_or_generate_profile(task_cfg, feature_names, provider, model)
 
     init_results()
@@ -867,21 +854,19 @@ def main(n_iterations: int | None = None) -> None:
         print(f"  Change : {description}")
         print(f"  Steps  : {len(new_config['steps'])}")
 
-        # ── Commit & evaluate ─────────────────────────────────────────────────
-        new_json = json.dumps(new_config, indent=2)
-        PIPELINE_FILE.write_text(new_json + "\n")
-        committed = git_commit(f"experiment #{exp_n}: {description}")
-        if not committed:
-            print("  Nothing changed vs HEAD; skipping.")
+        # ── Write & evaluate ──────────────────────────────────────────────────
+        if not pipeline_changed(new_config, base_config):
+            print("  Nothing changed vs base; skipping.")
             exp_n += 1
             continue
 
+        write_pipeline(new_config)
         print("  Running train.py...")
         result = run_train()
 
         if result.crashed:
             print(f"  CRASHED:\n{result.output[-500:]}")
-            git_revert_last()
+            write_pipeline(base_config)   # restore base on crash
             append_result(Record(
                 timestamp=datetime.now().isoformat(timespec="seconds"),
                 experiment=exp_n, description=description,
@@ -920,7 +905,7 @@ def main(n_iterations: int | None = None) -> None:
             pool_rank = new_entry.rank
             print(f"  Pool: {' | '.join(f'#{e.rank} {e.score:.4f}' for e in pool)}")
         else:
-            git_revert_last()
+            write_pipeline(base_config)   # restore base; candidate didn't qualify
             pool_rank = None
 
         append_result(Record(
