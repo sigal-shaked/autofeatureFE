@@ -12,5 +12,3 @@ dependencies = [
     "openai>=1.0",
 ]
 
-[tool.uv]
-dev-dependencies = []

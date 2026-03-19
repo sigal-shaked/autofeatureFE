@@ -1,0 +1,9 @@
+{
+  "description": "baseline \u2014 no feature engineering, standard scaling",
+  "steps": [
+    {
+      "op": "scale",
+      "method": "standard"
+    }
+  ]
+}

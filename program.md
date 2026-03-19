@@ -2,24 +2,21 @@
 
 ## What this is
 
-An autonomous agent loop that iteratively improves the feature engineering
-pipeline (`prepare.py`) for a tabular regression task using an LLM API.
+An autonomous agent loop that iteratively improves a **feature engineering
+pipeline** for a tabular regression task using an LLM API.
 
-Unlike its sister project (autoresearchFE) which optimizes a neural network
-architecture, this project targets the **data** side of the ML pipeline:
-
-- The model (XGBoost) and all its hyperparameters are **fixed**.
-- The agent's only lever is `prepare.py` — feature engineering, preprocessing,
-  feature selection.
-- No GPU required.
-- The internal reasoning engine is an external LLM (Claude / GPT-4).
+The agent may only compose operations from a **fixed, closed library** —
+no arbitrary code is generated or executed.  Every experiment is fully
+auditable as a JSON file.
 
 ## Files
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `prepare.py` | **Editable** (by agent) | Feature engineering & preprocessing pipeline |
-| `train.py` | **Fixed** (do not edit) | XGBoost training + val_rmse evaluation |
+| `pipeline.json` | **Editable** (by agent) | Feature engineering pipeline spec |
+| `operations.py` | **Fixed** | Library of all allowed operations |
+| `prepare.py` | **Fixed** | Loads pipeline.json, applies ops, returns arrays |
+| `train.py` | **Fixed** | XGBoost training + val_rmse evaluation |
 | `agent.py` | Entry point | LLM-powered agent loop |
 | `results.tsv` | Auto-generated | Experiment log |
 
@@ -28,18 +25,19 @@ architecture, this project targets the **data** side of the ML pipeline:
 ```
 SETUP:
   1. Create git branch  autofeature/<timestamp>
-  2. Measure baseline val_rmse on unmodified prepare.py
+  2. Measure baseline val_rmse on unmodified pipeline.json
   3. Record baseline in results.tsv
 
-LOOP (runs until you Ctrl-C):
-  1. Read current prepare.py + recent experiment history
-  2. Call LLM with context → receive improved prepare.py
-  3. Validate the code (syntax + API contract check)
-  4. git commit the change
-  5. Run train.py  →  val_rmse
-  6. If improved  → keep commit, record result
-     If not improved → git reset, record result
-  7. Go to 1
+LOOP (runs until Ctrl-C):
+  1. Read current pipeline.json + recent experiment history
+  2. Call LLM → receive improved pipeline.json
+  3. Validate: all ops in allowed set, last step is "scale", valid JSON
+  4. git commit pipeline.json
+  5. Run train.py → val_rmse
+  6. If improved → keep commit
+     If not       → git reset --hard HEAD~1
+  7. Record result in results.tsv
+  8. Go to 1
 ```
 
 ## Dataset & task
@@ -47,15 +45,46 @@ LOOP (runs until you Ctrl-C):
 - **Dataset**: California Housing (sklearn built-in)
 - **Task**: Regression — predict median house value ($100Ks)
 - **Metric**: `val_rmse` (lower is better)
-- **Split**: fixed 80/20 train/val, seed=42
+- **Split**: fixed 80/20 train/val, seed=42 (the agent cannot change this)
 
 Raw features: `MedInc`, `HouseAge`, `AveRooms`, `AveBedrms`, `Population`,
 `AveOccup`, `Latitude`, `Longitude`.
 
+## Allowed operations (closed set)
+
+| Category | Operations |
+|----------|-----------|
+| Unary transforms | `log1p`, `sqrt`, `square`, `cube`, `reciprocal`, `abs` |
+| Stateful unary | `clip`, `rank`, `quantile_normal`, `bin` |
+| Binary → new feature | `ratio`, `product`, `diff`, `sum_pair`, `log_ratio` |
+| Multi-feature | `polynomial`, `interaction` |
+| Geographic | `kmeans_cluster`, `kmeans_distance`, `distance_to_point` |
+| Selection | `drop`, `select` |
+| Scaling | `scale` (standard / robust / minmax / quantile) |
+
+Operations can be composed freely in any order.  Features created by one
+step can be referenced by any later step.
+
+## Example pipeline.json
+
+```json
+{
+  "description": "geo clusters + income log + rooms ratio",
+  "steps": [
+    {"op": "log1p", "features": ["MedInc", "Population"]},
+    {"op": "ratio", "numerator": "AveRooms", "denominator": "AveBedrms", "name": "rooms_per_bedrm"},
+    {"op": "ratio", "numerator": "Population", "denominator": "AveOccup", "name": "households"},
+    {"op": "kmeans_cluster", "features": ["Latitude", "Longitude"], "n_clusters": 15, "name": "geo_cluster"},
+    {"op": "distance_to_point", "lat": "Latitude", "lon": "Longitude",
+        "target_lat": 37.77, "target_lon": -122.42, "name": "dist_sf"},
+    {"op": "scale", "method": "robust"}
+  ]
+}
+```
+
 ## Running the agent
 
 ```bash
-# Install dependencies
 uv sync
 
 # With Anthropic Claude (default):
@@ -68,33 +97,8 @@ OPENAI_API_KEY=sk-... LLM_PROVIDER=openai uv run agent.py
 ANTHROPIC_API_KEY=sk-... LLM_MODEL=claude-opus-4-6 uv run agent.py
 ```
 
-The agent runs **indefinitely** until you stop it (Ctrl-C).
-Check `results.tsv` for the experiment log at any time.
-
 ## Running just the training
 
 ```bash
-uv run train.py
+uv run train.py   # prints val_rmse and n_features
 ```
-
-Prints `val_rmse: X.XXXXXX` and `n_features: N`.
-
-## What the agent can do to prepare.py
-
-- Add new engineered features (ratios, logs, polynomial terms, interactions)
-- Geographic features (distance to city centre, latitude × longitude)
-- Cluster-based features (k-means on lat/lon → location bucket)
-- Change scaling / normalization
-- Select / drop features
-- Any transformation using numpy, pandas, or scikit-learn
-
-## Contract: prepare_data()
-
-The agent must keep the function signature intact:
-
-```python
-def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (X_train, X_val, y_train, y_val) as float32 numpy arrays."""
-```
-
-RANDOM_SEED = 42 and VAL_SIZE = 0.2 must not change.

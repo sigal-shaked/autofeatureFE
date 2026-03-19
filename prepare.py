@@ -1,58 +1,54 @@
 """
-Feature engineering and preprocessing pipeline.
+Fixed data loading and pipeline executor — do NOT modify this file.
 
-This file is modified by the agent to improve feature quality.
-The agent may freely edit everything below the dashed separator.
-
-Returns:
-    X_train, X_val: numpy arrays of shape (n_samples, n_features)
-    y_train, y_val: numpy arrays of shape (n_samples,)
+Loads the raw California Housing dataset, applies the pipeline defined in
+pipeline.json via operations.py, and returns train/val arrays for train.py.
 """
 
+import json
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from sklearn.datasets import fetch_california_housing
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+
+from operations import apply_pipeline
 
 # ─── Fixed constants — do NOT change ─────────────────────────────────────────
 RANDOM_SEED = 42
 VAL_SIZE = 0.2
+PIPELINE_FILE = Path(__file__).parent / "pipeline.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
-# EXPERIMENT: baseline — raw features with standard scaling
 
-
-def prepare_data():
-    """Load, preprocess, and engineer features.
-
-    Returns (X_train, X_val, y_train, y_val) as float32 numpy arrays.
-    """
-    # Load dataset
-    # Features: MedInc, HouseAge, AveRooms, AveBedrms, Population, AveOccup, Latitude, Longitude
+def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load data, apply pipeline.json, return (X_train, X_val, y_train, y_val)."""
+    # Load raw features
     raw = fetch_california_housing()
     df = pd.DataFrame(raw.data, columns=raw.feature_names)
     y = raw.target.astype(np.float32)
 
-    # ── Feature engineering ───────────────────────────────────────────────────
-    # (baseline: no extra features — agent will improve this)
-
-    X = df.copy()
-
-    # ── Feature selection ─────────────────────────────────────────────────────
-    # (baseline: keep all features)
-
-    # ── Train / val split (do NOT change seed or size) ───────────────────────
-    X_train, X_val, y_train, y_val = train_test_split(
-        X.values, y, test_size=VAL_SIZE, random_state=RANDOM_SEED
+    # Fixed train / val split — indices never change
+    idx = np.arange(len(df))
+    idx_train, idx_val = train_test_split(
+        idx, test_size=VAL_SIZE, random_state=RANDOM_SEED
     )
+    df_train = df.iloc[idx_train].reset_index(drop=True)
+    df_val = df.iloc[idx_val].reset_index(drop=True)
+    y_train = y[idx_train]
+    y_val = y[idx_val]
 
-    # ── Scaling ───────────────────────────────────────────────────────────────
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train).astype(np.float32)
-    X_val = scaler.transform(X_val).astype(np.float32)
+    # Apply the feature engineering pipeline
+    with open(PIPELINE_FILE) as f:
+        config = json.load(f)
+    df_train, df_val = apply_pipeline(config["steps"], df_train, df_val)
 
-    return X_train, X_val, y_train, y_val
+    return (
+        df_train.values.astype(np.float32),
+        df_val.values.astype(np.float32),
+        y_train,
+        y_val,
+    )
 
 
 if __name__ == "__main__":
