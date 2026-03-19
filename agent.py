@@ -693,7 +693,7 @@ Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the comple
 # ─── Main loop ────────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def main(n_iterations: int | None = None) -> None:
     provider, model = detect_provider()
 
     # Load task config and build prompt once (it's constant for the session)
@@ -764,7 +764,9 @@ def main() -> None:
     exp_n += 1
 
     # ── Agent loop ────────────────────────────────────────────────────────────
-    while True:
+    iteration = 0
+    while n_iterations is None or iteration < n_iterations:
+        iteration += 1
         base = pool[pool_idx % len(pool)]
         pool_idx += 1
 
@@ -880,6 +882,76 @@ def main() -> None:
         ))
         records = load_results()
         exp_n += 1
+
+
+def run(
+    n_iterations: int | None = None,
+    *,
+    topk: int | None = None,
+    complexity_alpha: float | None = None,
+    include_history: bool | None = None,
+    history_size: int | None = None,
+    history_filter: str | None = None,
+    include_data_profile: bool | None = None,
+    regen_profile: bool | None = None,
+    train_timeout: int | None = None,
+    anthropic_api_key: str | None = None,
+    openai_api_key: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    working_dir: str | None = None,
+) -> None:
+    """Run the agent loop from Python code.
+
+    Example
+    -------
+    >>> from agent import run
+    >>> run(n_iterations=10, anthropic_api_key="sk-ant-...", topk=5)
+
+    Parameters
+    ----------
+    n_iterations    : Number of agent iterations to run (None = infinite).
+    topk            : Size of the top-k pipeline pool (default 5).
+    complexity_alpha: Weight of the feature-count penalty in the score (default 0.005).
+    include_history : Whether to include experiment history in each prompt.
+    history_size    : Max experiments to show in history (0 = all).
+    history_filter  : "all" (default) or "kept" (only pool entries).
+    include_data_profile: Whether to generate/use the one-time data profile.
+    regen_profile   : Force regeneration of the data profile even if cached.
+    train_timeout   : Seconds before a training run is killed (default 120).
+    anthropic_api_key: Anthropic API key (overrides ANTHROPIC_API_KEY env var).
+    openai_api_key  : OpenAI API key (overrides OPENAI_API_KEY env var).
+    llm_provider    : "anthropic" or "openai" (auto-detected if not set).
+    llm_model       : LLM model name override.
+    working_dir     : Path to the repo directory (defaults to current directory).
+    """
+    global TOPK, COMPLEXITY_ALPHA, INCLUDE_HISTORY, HISTORY_SIZE, HISTORY_FILTER
+    global INCLUDE_DATA_PROFILE, REGEN_PROFILE, TRAIN_TIMEOUT
+    global TASK_FILE, PIPELINE_FILE, POOL_FILE, RESULTS_FILE
+
+    if working_dir is not None:
+        import os as _os
+        _os.chdir(working_dir)
+        TASK_FILE     = Path("task.json")
+        PIPELINE_FILE = Path("pipeline.json")
+        POOL_FILE     = Path("topk_pool.json")
+        RESULTS_FILE  = Path("results.tsv")
+
+    if topk             is not None: TOPK              = topk
+    if complexity_alpha is not None: COMPLEXITY_ALPHA  = complexity_alpha
+    if include_history  is not None: INCLUDE_HISTORY   = include_history
+    if history_size     is not None: HISTORY_SIZE      = history_size
+    if history_filter   is not None: HISTORY_FILTER    = history_filter
+    if include_data_profile is not None: INCLUDE_DATA_PROFILE = include_data_profile
+    if regen_profile    is not None: REGEN_PROFILE     = regen_profile
+    if train_timeout    is not None: TRAIN_TIMEOUT     = train_timeout
+
+    if anthropic_api_key: os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
+    if openai_api_key:    os.environ["OPENAI_API_KEY"]    = openai_api_key
+    if llm_provider:      os.environ["LLM_PROVIDER"]      = llm_provider
+    if llm_model:         os.environ["LLM_MODEL"]         = llm_model
+
+    main(n_iterations)
 
 
 if __name__ == "__main__":
