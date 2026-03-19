@@ -48,8 +48,16 @@ TASK_FILE = Path("task.json")
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_OPENAI_MODEL    = "gpt-4o"
 MAX_TOKENS       = 4096
-HISTORY_SIZE     = 12
 MAX_LLM_RETRIES  = 3
+
+# History shown to the LLM (all configurable via env vars):
+#   INCLUDE_HISTORY=false  → omit history section entirely
+#   HISTORY_SIZE=N         → max number of experiments to show (0 = unlimited)
+#   HISTORY_FILTER=kept    → show only experiments that entered the pool
+#                  all     → show every experiment (default)
+INCLUDE_HISTORY  = os.environ.get("INCLUDE_HISTORY", "true").lower() != "false"
+HISTORY_SIZE     = int(os.environ.get("HISTORY_SIZE", "20"))   # 0 = unlimited
+HISTORY_FILTER   = os.environ.get("HISTORY_FILTER", "all")     # "all" | "kept"
 TRAIN_TIMEOUT    = 120   # seconds
 
 TOPK             = int(float(os.environ.get("TOPK", "5")))
@@ -492,11 +500,22 @@ def append_result(r: Record) -> None:
 def format_history(records: list[Record], metric_name: str) -> str:
     if not records:
         return "(no experiments yet)"
-    recent = records[-HISTORY_SIZE:]
+
+    # Apply filter
+    visible = [r for r in records if r.kept] if HISTORY_FILTER == "kept" else records
+
+    # Apply size cap (0 = unlimited)
+    if HISTORY_SIZE > 0:
+        visible = visible[-HISTORY_SIZE:]
+
+    if not visible:
+        return "(no matching experiments yet)"
+
     col = metric_name or "metric"
-    rows = [f"#exp | score  | {col:9s} | n_feat | pool | description"]
+    filter_note = " (pool entries only)" if HISTORY_FILTER == "kept" else ""
+    rows = [f"#exp | score  | {col:9s} | n_feat | pool | description{filter_note}"]
     rows.append(f"---- | ------ | {'-'*9} | ------ | ---- | -----------")
-    for r in recent:
+    for r in visible:
         raw_s   = f"{r.val_score:.6f}" if r.val_score is not None else "CRASH   "
         score_s = f"{r.score:.4f}"     if r.score     is not None else "CRASH "
         feat_s  = str(r.n_features)    if r.n_features else "?"
@@ -513,6 +532,10 @@ def build_messages(
 ) -> list[dict]:
     metric_name = task_cfg["metric"]
     base_json   = json.dumps({"description": base.description, "steps": base.steps}, indent=2)
+    history_section = ""
+    if INCLUDE_HISTORY:
+        history_section = f"\nExperiment history (most recent last):\n{format_history(records, metric_name)}\n"
+
     content = f"""\
 Top-{TOPK} pipeline pool (rank 1 = best score):
 {format_pool(pool)}
@@ -521,10 +544,7 @@ Base pipeline for this iteration: rank {base.rank} — "{base.description}"
 ```json
 {base_json}
 ```
-
-Experiment history (most recent last):
-{format_history(records, metric_name)}
-
+{history_section}
 Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the complete updated pipeline.
 """
     return [{"role": "user", "content": content}]
@@ -549,6 +569,11 @@ def main() -> None:
     print(f"Metric           : {metric_name}")
     print(f"Top-k            : {TOPK}")
     print(f"Complexity alpha : {COMPLEXITY_ALPHA}")
+    history_desc = (
+        "off" if not INCLUDE_HISTORY
+        else f"{HISTORY_FILTER}, last {'∞' if HISTORY_SIZE == 0 else HISTORY_SIZE}"
+    )
+    print(f"History          : {history_desc}")
     print()
 
     branch = git_setup_branch()
