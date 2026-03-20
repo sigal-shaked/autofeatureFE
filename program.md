@@ -1,104 +1,196 @@
-# AutoFeature — Autonomous Feature Engineering Optimizer
+# AutoFeatureFE
 
-## What this is
+Autonomous feature-engineering optimizer.  An LLM agent iteratively proposes
+feature pipelines; a fixed XGBoost model evaluates them.  Only the features
+change — the model and its hyperparameters never do.
 
-An autonomous agent loop that iteratively improves a **feature engineering
-pipeline** for a tabular regression task using an LLM API.
+---
 
-The agent may only compose operations from a **fixed, closed library** —
-no arbitrary code is generated or executed.  Every experiment is fully
-auditable as a JSON file.
+## Architecture
+
+```
+task.json          ← human configures task / dataset / metric (never touched by agent)
+pipeline.json      ← agent edits this (JSON, not code)
+    ↓
+prepare.py         ← FIXED: loads data, applies pipeline, returns X/y arrays
+operations.py      ← FIXED: closed library of ~40 allowed feature ops
+train.py           ← FIXED: trains XGBoost, prints val_score / metric_name / n_features
+    ↓
+results.tsv        ← append-only experiment log (all runs, human-readable)
+topk_pool.json     ← top-k best pipelines (JSON, survives restarts)
+data_profile_*.md  ← cached one-time LLM analysis of the raw dataset
+```
+
+The agent never generates or executes arbitrary Python.  It only writes JSON
+to `pipeline.json`.  `prepare.py` and `operations.py` are the only code that
+runs on data, and they are fixed.
+
+---
 
 ## Files
 
-| File | Status | Purpose |
-|------|--------|---------|
-| `pipeline.json` | **Editable** (by agent) | Feature engineering pipeline spec |
-| `operations.py` | **Fixed** | Library of all allowed operations |
-| `prepare.py` | **Fixed** | Loads pipeline.json, applies ops, returns arrays |
-| `train.py` | **Fixed** | XGBoost training + val_rmse evaluation |
-| `agent.py` | Entry point | LLM-powered agent loop |
-| `results.tsv` | Auto-generated | Experiment log |
+| File | Role | Editable? |
+|---|---|---|
+| `task.json` | Task config (dataset, metric, task type) | Human only |
+| `pipeline.json` | Current feature pipeline | Agent writes |
+| `prepare.py` | Data loading + pipeline execution | Fixed |
+| `operations.py` | Feature op library | Fixed |
+| `train.py` | Model training + evaluation | Fixed |
+| `agent.py` | LLM agent loop | Fixed |
+| `results.tsv` | Experiment log | Append-only |
+| `topk_pool.json` | Top-k pipeline pool | Agent writes |
 
-## How it works
+---
 
-```
-SETUP:
-  1. Create git branch  autofeature/<timestamp>
-  2. Measure baseline val_rmse on unmodified pipeline.json
-  3. Record baseline in results.tsv
-
-LOOP (runs until Ctrl-C):
-  1. Read current pipeline.json + recent experiment history
-  2. Call LLM → receive improved pipeline.json
-  3. Validate: all ops in allowed set, last step is "scale", valid JSON
-  4. git commit pipeline.json
-  5. Run train.py → val_rmse
-  6. If improved → keep commit
-     If not       → git reset --hard HEAD~1
-  7. Record result in results.tsv
-  8. Go to 1
-```
-
-## Dataset & task
-
-- **Dataset**: California Housing (sklearn built-in)
-- **Task**: Regression — predict median house value ($100Ks)
-- **Metric**: `val_rmse` (lower is better)
-- **Split**: fixed 80/20 train/val, seed=42 (the agent cannot change this)
-
-Raw features: `MedInc`, `HouseAge`, `AveRooms`, `AveBedrms`, `Population`,
-`AveOccup`, `Latitude`, `Longitude`.
-
-## Allowed operations (closed set)
-
-| Category | Operations |
-|----------|-----------|
-| Unary transforms | `log1p`, `sqrt`, `square`, `cube`, `reciprocal`, `abs` |
-| Stateful unary | `clip`, `rank`, `quantile_normal`, `bin` |
-| Binary → new feature | `ratio`, `product`, `diff`, `sum_pair`, `log_ratio` |
-| Multi-feature | `polynomial`, `interaction` |
-| Geographic | `kmeans_cluster`, `kmeans_distance`, `distance_to_point` |
-| Selection | `drop`, `select` |
-| Scaling | `scale` (standard / robust / minmax / quantile) |
-
-Operations can be composed freely in any order.  Features created by one
-step can be referenced by any later step.
-
-## Example pipeline.json
+## Configuration (task.json)
 
 ```json
 {
-  "description": "geo clusters + income log + rooms ratio",
+  "task":    "regression",            // or "classification"
+  "dataset": "california_housing",   // see supported datasets below
+  "metric":  "rmse"                  // rmse | auc | logloss
+}
+```
+
+**Supported datasets (built-in):**
+- `california_housing` — regression, 8 features
+- `breast_cancer`      — binary classification, 30 features
+- `wine`               — multiclass classification, 13 features
+
+**Custom CSV dataset:**
+```json
+{
+  "task":          "classification",
+  "dataset":       "csv",
+  "csv_path":      "mydata.csv",
+  "target_column": "label",
+  "metric":        "auc"
+}
+```
+
+---
+
+## Pipeline format (pipeline.json)
+
+```json
+{
+  "description": "log fare + family size ratio + geo clusters",
   "steps": [
-    {"op": "log1p", "features": ["MedInc", "Population"]},
-    {"op": "ratio", "numerator": "AveRooms", "denominator": "AveBedrms", "name": "rooms_per_bedrm"},
-    {"op": "ratio", "numerator": "Population", "denominator": "AveOccup", "name": "households"},
-    {"op": "kmeans_cluster", "features": ["Latitude", "Longitude"], "n_clusters": 15, "name": "geo_cluster"},
-    {"op": "distance_to_point", "lat": "Latitude", "lon": "Longitude",
-        "target_lat": 37.77, "target_lon": -122.42, "name": "dist_sf"},
-    {"op": "scale", "method": "robust"}
+    {"op": "log1p",         "features": ["fare"]},
+    {"op": "ratio",         "numerator": "fare", "denominator": "family_size", "name": "fare_per_person"},
+    {"op": "kmeans_cluster","features": ["lat", "lon"], "n_clusters": 8, "name": "geo_cluster"},
+    {"op": "scale",         "method": "standard"}
   ]
 }
 ```
 
-## Running the agent
+Rules enforced by `validate_pipeline()`:
+- All ops must be from the allowed set in `operations.py`
+- Last step must always be `"scale"`
+- Must include `"description"`
 
+---
+
+## Agent loop
+
+1. **Baseline** — evaluate the current `pipeline.json`, add to pool
+2. **Round-robin** — pick a base pipeline from the top-k pool
+3. **LLM call** — ask LLM to improve the base pipeline; up to 3 retries on invalid JSON
+4. **Validate** — check all ops are allowed, last step is scale, no blocked patterns (freestyle)
+5. **Evaluate** — write candidate to `pipeline.json`, run `train.py`
+6. **Score** — `score = primary_metric + COMPLEXITY_ALPHA × ln(n_features)`
+   - regression: `primary = val_rmse`
+   - classification AUC: `primary = 1 − val_auc`
+   - classification logloss: `primary = val_logloss`
+7. **Pool update** — if score enters top-k: keep; else restore base pipeline
+8. **Log** — append row to `results.tsv`
+
+---
+
+## Allowed operations
+
+### Unary transforms (in-place)
+`log1p`, `sqrt`, `square`, `cube`, `reciprocal`, `abs`
+
+### Stateful unary (fit on train, apply to val)
+`clip`, `rank`, `quantile_normal`, `bin`
+
+### Binary → new column
+`ratio`, `product`, `diff`, `sum_pair`, `log_ratio`
+
+### Multi-feature → new columns
+`polynomial`, `interaction`
+
+### Geographic
+`kmeans_cluster`, `kmeans_distance`, `distance_to_point`
+
+### Selection
+`drop`, `select`
+
+### Scaling (always last)
+`scale` — methods: `standard`, `robust`, `minmax`, `quantile`
+
+### Freestyle (opt-in, disabled by default)
+Short Python snippets (`df['x'] = ...`).  Guarded by a pattern blocklist,
+restricted builtins, and post-exec row/dtype checks.
+Enable with `ALLOW_FREESTYLE=true` or `allow_freestyle=True` in `run()`.
+
+---
+
+## Running
+
+**Terminal:**
 ```bash
-uv sync
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-... uv run agent.py
 
-# With Anthropic Claude (default):
-ANTHROPIC_API_KEY=sk-... uv run agent.py
-
-# With OpenAI GPT-4:
+# OpenAI
 OPENAI_API_KEY=sk-... LLM_PROVIDER=openai uv run agent.py
 
-# Override model:
-ANTHROPIC_API_KEY=sk-... LLM_MODEL=claude-opus-4-6 uv run agent.py
+# Key options
+TOPK=5                  # pool size (default 5)
+COMPLEXITY_ALPHA=0.005  # feature-count penalty (default 0.005)
+INCLUDE_HISTORY=true    # include past experiments in prompt (default true)
+HISTORY_SIZE=20         # max history rows shown to LLM (0 = all)
+HISTORY_FILTER=all      # "all" or "kept" (pool entries only)
+DATA_PROFILE=true       # one-time LLM dataset analysis (default true)
+ALLOW_FREESTYLE=false   # allow LLM Python snippets (default false)
 ```
 
-## Running just the training
+**Python API:**
+```python
+from agent import run
 
-```bash
-uv run train.py   # prints val_rmse and n_features
+run(
+    n_iterations         = 20,
+    anthropic_api_key    = "sk-ant-...",
+    topk                 = 5,
+    complexity_alpha     = 0.005,
+    include_history      = True,
+    history_size         = 20,
+    include_data_profile = True,
+    allow_freestyle      = False,
+    working_dir          = "/path/to/repo",   # if running from elsewhere
+)
 ```
+
+---
+
+## Experiment log (results.tsv)
+
+One row per experiment.  Columns:
+
+| Column | Description |
+|---|---|
+| timestamp | ISO-8601 |
+| experiment | Sequential integer |
+| description | LLM-written description of the change |
+| val_score | Raw metric value (rmse / auc / logloss) |
+| metric | Metric name |
+| n_features | Feature count after pipeline |
+| score | Composite score (primary + complexity penalty) |
+| pool_rank | Rank in top-k pool (blank if not in pool) |
+| kept | yes / no |
+| crashed | yes / no |
+
+View with: `column -t -s $'\t' results.tsv`

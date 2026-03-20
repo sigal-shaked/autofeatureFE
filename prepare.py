@@ -28,8 +28,10 @@ PIPELINE_FILE = Path(__file__).parent / "pipeline.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _load_dataset(dataset: str) -> tuple[pd.DataFrame, np.ndarray]:
-    """Return (df_features, y) for the requested dataset."""
+def _load_dataset(task_cfg: dict) -> tuple[pd.DataFrame, np.ndarray]:
+    """Return (df_features, y) for the dataset specified in task_cfg."""
+    dataset = task_cfg["dataset"]
+
     if dataset == "california_housing":
         from sklearn.datasets import fetch_california_housing
         raw = fetch_california_housing()
@@ -67,9 +69,8 @@ def _load_dataset(dataset: str) -> tuple[pd.DataFrame, np.ndarray]:
 def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load data, apply pipeline.json, return (X_train, X_val, y_train, y_val)."""
     task_cfg = json.loads(TASK_FILE.read_text())
-    dataset  = task_cfg["dataset"]
 
-    df, y = _load_dataset(dataset)
+    df, y = _load_dataset(task_cfg)
 
     # Fixed train / val split — never changes
     idx = np.arange(len(df))
@@ -96,16 +97,12 @@ def prepare_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 def get_feature_names() -> list[str]:
     """Return original feature names for the configured dataset (used by agent)."""
     task_cfg = json.loads(TASK_FILE.read_text())
-    if task_cfg["dataset"] == "csv":
-        csv_path   = Path(__file__).parent / task_cfg["csv_path"]
-        target_col = task_cfg["target_column"]
-        return pd.read_csv(csv_path).drop(columns=[target_col]).columns.tolist()
-    df, _ = _load_dataset(task_cfg["dataset"])
+    df, _    = _load_dataset(task_cfg)
     return df.columns.tolist()
 
 
 if __name__ == "__main__":
     X_train, X_val, y_train, y_val = prepare_data()
-    print(f"Train : {X_train.shape}")
-    print(f"Val   : {X_val.shape}")
+    print(f"Train   : {X_train.shape}")
+    print(f"Val     : {X_val.shape}")
     print(f"y dtype : {y_train.dtype}  range [{y_train.min():.3f}, {y_train.max():.3f}]")

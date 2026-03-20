@@ -139,10 +139,8 @@ Original features: {names_str}
 ── Geographic ops ────────────────────────────────────────────────────────────
 {"op": "kmeans_cluster",  "features": ["Latitude", "Longitude"], "n_clusters": 10, "name": "geo_cluster"}
 {"op": "kmeans_distance", "features": ["Latitude", "Longitude"], "n_clusters": 8,  "prefix": "kdist"}
-{"op": "distance_to_point", "lat": "Latitude", "lon": "Longitude",
-    "target_lat": 37.77, "target_lon": -122.42, "name": "dist_sf"}
-// CA reference points: LA (34.05,-118.24), SD (32.72,-117.15),
-//   San Jose (37.34,-121.89), Sacramento (38.58,-121.49), Fresno (36.74,-119.79)
+{"op": "distance_to_point", "lat": "lat_col", "lon": "lon_col",
+    "target_lat": 37.77, "target_lon": -122.42, "name": "dist_to_point"}
 
 ── Selection ─────────────────────────────────────────────────────────────────
 {"op": "drop",   "features": ["AveBedrms"]}
@@ -371,7 +369,7 @@ def compute_score(primary: float, n_features: int) -> float:
 class PoolEntry:
     rank: int
     experiment: int
-    val_rmse: float
+    val_score: float
     n_features: int
     score: float
     description: str
@@ -402,12 +400,12 @@ def update_pool(pool: list[PoolEntry], entry: PoolEntry, k: int) -> list[PoolEnt
     return pool
 
 
-def format_pool(pool: list[PoolEntry]) -> str:
-    rows = [f"rank | score  | val_rmse | n_feat | description"]
-    rows.append("---- | ------ | -------- | ------ | -----------")
+def format_pool(pool: list[PoolEntry], metric_name: str = "val_score") -> str:
+    rows = [f"rank | score  | {metric_name:<10} | n_feat | description"]
+    rows.append(f"---- | ------ | {'-'*10} | ------ | -----------")
     for e in pool:
         rows.append(
-            f"{e.rank:4d} | {e.score:.4f} | {e.val_rmse:.6f} | {e.n_features:6d} | {e.description}"
+            f"{e.rank:4d} | {e.score:.4f} | {e.val_score:.6f}   | {e.n_features:6d} | {e.description}"
         )
     return "\n".join(rows)
 
@@ -584,13 +582,19 @@ Use bullet points.  Do NOT suggest model changes; focus only on the features.
 """
 
 
+def _as_series(arr, ref_df):
+    """Wrap a numpy array as a pandas Series aligned with ref_df's index."""
+    import pandas as pd
+    return pd.Series(arr, index=ref_df.index)
+
+
 def _compute_raw_stats(task_cfg: dict, feature_names: list[str]) -> str:
     """Return a statistical summary of the raw training data as a formatted string."""
     import numpy as np
     from sklearn.model_selection import train_test_split
     from prepare import _load_dataset
 
-    df, y = _load_dataset(task_cfg["dataset"])
+    df, y = _load_dataset(task_cfg)
     idx = np.arange(len(df))
     idx_train, _ = train_test_split(idx, test_size=0.2, random_state=42)
     df_tr = df.iloc[idx_train].reset_index(drop=True)
@@ -617,7 +621,7 @@ def _compute_raw_stats(task_cfg: dict, feature_names: list[str]) -> str:
 
     lines += ["", "CORRELATION WITH TARGET (Pearson r):"]
     corrs = sorted(
-        [(col, float(df_tr[col].corr(import_series(y_tr, df_tr)))) for col in feature_names],
+        [(col, float(df_tr[col].corr(_as_series(y_tr, df_tr)))) for col in feature_names],
         key=lambda x: abs(x[1]), reverse=True,
     )
     for col, r in corrs:
@@ -639,21 +643,14 @@ def _compute_raw_stats(task_cfg: dict, feature_names: list[str]) -> str:
         lines.append("  (none above threshold)")
 
     if task_cfg["task"] == "regression":
-        lines += ["", f"TARGET: mean={y_tr.mean():.4f}  std={y_tr.std():.4f}  skew={float(import_series(y_tr, df_tr).skew()):.2f}  min={y_tr.min():.4f}  max={y_tr.max():.4f}"]
+        lines += ["", f"TARGET: mean={y_tr.mean():.4f}  std={y_tr.std():.4f}  skew={float(_as_series(y_tr, df_tr).skew()):.2f}  min={y_tr.min():.4f}  max={y_tr.max():.4f}"]
     else:
-        import numpy as np
         classes, counts = np.unique(y_tr, return_counts=True)
         lines += ["", "TARGET CLASS DISTRIBUTION:"]
         for cls, cnt in zip(classes, counts):
             lines.append(f"  class {cls}: {cnt} ({100*cnt/len(y_tr):.1f}%)")
 
     return "\n".join(lines)
-
-
-def import_series(arr, ref_df):
-    """Wrap a numpy array as a pandas Series aligned with ref_df's index."""
-    import pandas as pd
-    return pd.Series(arr, index=ref_df.index)
 
 
 def load_or_generate_profile(
@@ -712,7 +709,7 @@ def build_messages(
 
     content = f"""\
 Top-{TOPK} pipeline pool (rank 1 = best score):
-{format_pool(pool)}
+{format_pool(pool, metric_name)}
 
 Base pipeline for this iteration: rank {base.rank} — "{base.description}"
 ```json
@@ -784,7 +781,7 @@ def main(n_iterations: int | None = None) -> None:
 
     baseline_entry = PoolEntry(
         rank=1, experiment=exp_n,
-        val_rmse=baseline.val_score, n_features=baseline.n_features,
+        val_score=baseline.val_score, n_features=baseline.n_features,
         score=baseline_score, description="baseline", steps=baseline_steps,
     )
     pool = update_pool(pool, baseline_entry, TOPK)
@@ -896,7 +893,7 @@ def main(n_iterations: int | None = None) -> None:
         if enters_pool:
             new_entry = PoolEntry(
                 rank=0, experiment=exp_n,
-                val_rmse=result.val_score, n_features=result.n_features,
+                val_score=result.val_score, n_features=result.n_features,
                 score=score, description=description,
                 steps=new_config["steps"],
             )
