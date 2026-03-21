@@ -185,4 +185,4 @@ column -t -s $'\t' results.tsv
 
 ## Inspired by
 
-[`autoresearchFE`](https://github.com/karpathy/autoresearch) by Andrej Karpathy — which applies the same agent-loop idea to model architecture search.  This repo shifts the optimization target from the model to the feature pipeline, enabling CPU-only runs on any tabular dataset.
+[`autoresearchFE`](https://github.com/sigal-shaked/autoresearchFE) — an agent-loop approach to model architecture search for tabular ML.  This repo shifts the optimization target from the model to the feature pipeline, enabling CPU-only runs on any tabular dataset.
