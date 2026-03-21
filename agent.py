@@ -70,6 +70,7 @@ REGEN_PROFILE        = os.environ.get("REGEN_PROFILE", "false").lower() == "true
 
 TOPK             = int(float(os.environ.get("TOPK", "5")))
 COMPLEXITY_ALPHA = float(os.environ.get("COMPLEXITY_ALPHA", "0.005"))
+MAX_ITER         = int(os.environ.get("MAX_ITER", "0"))   # 0 = unlimited
 
 # Freestyle op — disabled by default.  When enabled the LLM may propose a
 # short Python snippet as an operation.  The code is safety-checked before
@@ -725,6 +726,7 @@ Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the comple
 
 
 def main(n_iterations: int | None = None) -> None:
+    limit = n_iterations or (MAX_ITER if MAX_ITER > 0 else None)
     provider, model = detect_provider()
 
     # Load task config and build prompt once (it's constant for the session)
@@ -746,6 +748,7 @@ def main(n_iterations: int | None = None) -> None:
     )
     print(f"History          : {history_desc}")
     print(f"Data profile     : {'enabled' if INCLUDE_DATA_PROFILE else 'disabled'}")
+    print(f"Max iterations   : {'∞' if limit is None else limit}")
     print(f"Freestyle ops    : {'ENABLED ⚠️  (LLM code will be exec-d)' if ALLOW_FREESTYLE else 'disabled'}")
     if ALLOW_FREESTYLE:
         print("  ⚠️  WARNING: freestyle mode executes LLM-generated Python code.")
@@ -761,45 +764,53 @@ def main(n_iterations: int | None = None) -> None:
     exp_n    = len(records) + 1
     pool_idx = 0   # round-robin cursor
 
-    # ── Baseline ──────────────────────────────────────────────────────────────
-    print("─" * 60)
-    print("Measuring baseline...")
-    baseline = run_train()
-    if baseline.crashed:
-        print("Baseline CRASHED:")
-        print(baseline.output[-800:])
-        sys.exit("Fix pipeline.json / task.json before running the agent.")
+    # ── Baseline or resume ────────────────────────────────────────────────────
+    if pool:
+        # Resuming: restore pipeline.json from the current rank-1 entry
+        print("─" * 60)
+        print(f"Resuming from existing pool ({len(pool)} entries, exp #{exp_n})")
+        print(f"  Best so far: score={pool[0].score:.4f}  {metric_name}={pool[0].val_score:.6f}  \"{pool[0].description}\"")
+        PIPELINE_FILE.write_text(json.dumps({"description": pool[0].description, "steps": pool[0].steps}, indent=2) + "\n")
+    else:
+        # Fresh start: measure baseline
+        print("─" * 60)
+        print("Measuring baseline...")
+        baseline = run_train()
+        if baseline.crashed:
+            print("Baseline CRASHED:")
+            print(baseline.output[-800:])
+            sys.exit("Fix pipeline.json / task.json before running the agent.")
 
-    baseline_steps   = json.loads(PIPELINE_FILE.read_text())["steps"]
-    baseline_primary = baseline.primary()
-    baseline_score   = compute_score(baseline_primary, baseline.n_features)
-    print(
-        f"  {metric_name}={baseline.val_score:.6f}"
-        f"  n_features={baseline.n_features}"
-        f"  score={baseline_score:.4f}"
-    )
+        baseline_steps   = json.loads(PIPELINE_FILE.read_text())["steps"]
+        baseline_primary = baseline.primary()
+        baseline_score   = compute_score(baseline_primary, baseline.n_features)
+        print(
+            f"  {metric_name}={baseline.val_score:.6f}"
+            f"  n_features={baseline.n_features}"
+            f"  score={baseline_score:.4f}"
+        )
 
-    baseline_entry = PoolEntry(
-        rank=1, experiment=exp_n,
-        val_score=baseline.val_score, n_features=baseline.n_features,
-        score=baseline_score, description="baseline", steps=baseline_steps,
-    )
-    pool = update_pool(pool, baseline_entry, TOPK)
-    save_pool(pool)
+        baseline_entry = PoolEntry(
+            rank=1, experiment=exp_n,
+            val_score=baseline.val_score, n_features=baseline.n_features,
+            score=baseline_score, description="baseline", steps=baseline_steps,
+        )
+        pool = update_pool(pool, baseline_entry, TOPK)
+        save_pool(pool)
 
-    append_result(Record(
-        timestamp=datetime.now().isoformat(timespec="seconds"),
-        experiment=exp_n, description="baseline",
-        val_score=baseline.val_score, metric_name=metric_name,
-        n_features=baseline.n_features, score=baseline_score,
-        pool_rank=baseline_entry.rank, kept=True, crashed=False,
-    ))
-    records = load_results()
-    exp_n += 1
+        append_result(Record(
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            experiment=exp_n, description="baseline",
+            val_score=baseline.val_score, metric_name=metric_name,
+            n_features=baseline.n_features, score=baseline_score,
+            pool_rank=baseline_entry.rank, kept=True, crashed=False,
+        ))
+        records = load_results()
+        exp_n += 1
 
     # ── Agent loop ────────────────────────────────────────────────────────────
     iteration = 0
-    while n_iterations is None or iteration < n_iterations:
+    while limit is None or iteration < limit:
         iteration += 1
         base = pool[pool_idx % len(pool)]
         pool_idx += 1
@@ -919,6 +930,7 @@ def main(n_iterations: int | None = None) -> None:
 def run(
     n_iterations: int | None = None,
     *,
+    max_iter: int | None = None,
     topk: int | None = None,
     complexity_alpha: float | None = None,
     include_history: bool | None = None,
@@ -943,7 +955,8 @@ def run(
 
     Parameters
     ----------
-    n_iterations    : Number of agent iterations to run (None = infinite).
+    n_iterations    : Number of agent iterations to run (None = use max_iter or run forever).
+    max_iter        : Alias for n_iterations; also set via MAX_ITER env var.
     topk            : Size of the top-k pipeline pool (default 5).
     complexity_alpha: Weight of the feature-count penalty in the score (default 0.005).
     include_history : Whether to include experiment history in each prompt.
@@ -962,7 +975,7 @@ def run(
     working_dir     : Path to the repo directory (defaults to current directory).
     """
     global TOPK, COMPLEXITY_ALPHA, INCLUDE_HISTORY, HISTORY_SIZE, HISTORY_FILTER
-    global INCLUDE_DATA_PROFILE, REGEN_PROFILE, TRAIN_TIMEOUT, ALLOW_FREESTYLE
+    global INCLUDE_DATA_PROFILE, REGEN_PROFILE, TRAIN_TIMEOUT, ALLOW_FREESTYLE, MAX_ITER
     global TASK_FILE, PIPELINE_FILE, POOL_FILE, RESULTS_FILE
 
     if working_dir is not None:
@@ -982,6 +995,7 @@ def run(
     if regen_profile    is not None: REGEN_PROFILE     = regen_profile
     if train_timeout    is not None: TRAIN_TIMEOUT     = train_timeout
     if allow_freestyle  is not None: ALLOW_FREESTYLE   = allow_freestyle
+    if max_iter         is not None: MAX_ITER          = max_iter
 
     if anthropic_api_key: os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
     if openai_api_key:    os.environ["OPENAI_API_KEY"]    = openai_api_key
