@@ -143,6 +143,12 @@ Original features: {names_str}
 {"op": "distance_to_point", "lat": "lat_col", "lon": "lon_col",
     "target_lat": 37.77, "target_lon": -122.42, "name": "dist_to_point"}
 
+── Preprocessing (usually early — before transforms) ────────────────────────
+{"op": "fillna", "strategy": "mean"}                              // fill all NaN cols with train mean
+{"op": "fillna", "strategy": "median", "features": ["Age"]}       // fill specific cols with median
+{"op": "fillna", "strategy": "constant", "constant": 0}           // strategies: mean|median|mode|zero|constant
+{"op": "drop_missing_cols", "threshold": 0.5}                     // drop cols with >50% missing on train
+
 ── Selection ─────────────────────────────────────────────────────────────────
 {"op": "drop",   "features": ["AveBedrms"]}
 {"op": "select", "features": ["MedInc", "Latitude", "Longitude"]}  // keep only these
@@ -204,6 +210,12 @@ TASK
 Dataset  : {dataset}
 ML task  : {task}
 Metric   : {metric_desc}
+
+NOTE — automatic preprocessing (not part of the pipeline you control):
+  • ID columns are dropped automatically.
+  • Datetime columns are decomposed into year/month/day/weekday/hour components.
+  • Categorical / ordinal columns are ordinal-encoded to integers before the pipeline runs.
+  The feature list below shows the post-encoding feature names available to you.
 
 Improve the feature engineering pipeline to minimise the SCORE:
 
@@ -593,60 +605,103 @@ def _compute_raw_stats(task_cfg: dict, feature_names: list[str]) -> str:
     """Return a statistical summary of the raw training data as a formatted string."""
     import numpy as np
     from sklearn.model_selection import train_test_split
-    from prepare import _load_dataset
+    from prepare import _load_raw, _get_field_types
+    from field_types import auto_encode
 
-    df, y = _load_dataset(task_cfg)
+    df, y, openml_features = _load_raw(task_cfg)
+    field_types = _get_field_types(task_cfg, df, openml_features)
+
     idx = np.arange(len(df))
     idx_train, _ = train_test_split(idx, test_size=0.2, random_state=42)
-    df_tr = df.iloc[idx_train].reset_index(drop=True)
-    y_tr  = y[idx_train]
+    df_tr_raw = df.iloc[idx_train].reset_index(drop=True)
+    df_va_raw = df.iloc[~np.isin(idx, idx_train)].reset_index(drop=True)
+    y_tr = y[idx_train]
 
+    # Auto-encode to get the post-encoding columns (what the agent actually sees)
+    df_tr, _, encode_report = auto_encode(df_tr_raw, df_va_raw.copy(), field_types)
+
+    # ── Field type summary ────────────────────────────────────────────────────
     lines = [
         f"DATASET  : {task_cfg['dataset']}",
         f"TASK     : {task_cfg['task']}",
         f"METRIC   : {task_cfg['metric']}",
         f"SAMPLES  : {len(df)} total  ({len(df_tr)} train  {len(df)-len(df_tr)} val)",
-        f"FEATURES : {len(feature_names)}",
+        f"FEATURES : {len(df_tr.columns)} (after auto-encoding)",
         "",
-        f"{'Feature':<22} {'mean':>9} {'std':>9} {'skew':>6} {'min':>9} {'p25':>9} {'p50':>9} {'p75':>9} {'max':>9}",
-        "-" * 100,
+        "FIELD TYPES (raw, before pipeline):",
     ]
-    for col in feature_names:
-        v = df_tr[col].values
-        skew = float(df_tr[col].skew())
-        p25, p50, p75 = float(df_tr[col].quantile(0.25)), float(df_tr[col].median()), float(df_tr[col].quantile(0.75))
+    for col, ftype in field_types.items():
+        raw_s = df[col]
+        n_missing = int(raw_s.isna().sum())
+        pct = 100 * n_missing / len(df)
+        note = f"  [{n_missing} missing, {pct:.1f}%]" if n_missing else ""
+        lines.append(f"  {col:<30} {ftype}{note}")
+
+    if encode_report["dropped_id"]:
+        lines.append(f"\n  → Dropped (ID): {encode_report['dropped_id']}")
+    if encode_report["expanded_datetime"]:
+        lines.append(f"  → Expanded (datetime): {encode_report['expanded_datetime']}")
+    if encode_report["encoded_categorical"]:
+        lines.append(f"  → Ordinal-encoded: {encode_report['encoded_categorical']}")
+
+    # ── Per-feature statistics (numeric columns only) ─────────────────────────
+    num_cols = [c for c in df_tr.columns if df_tr[c].dtype.kind in "fiu"]
+    lines += [
+        "",
+        f"{'Feature':<30} {'mean':>9} {'std':>9} {'skew':>6} {'min':>9} {'p50':>9} {'max':>9} {'%miss':>6}",
+        "-" * 106,
+    ]
+    for col in num_cols:
+        s = df_tr[col]
+        pct_miss = 100 * s.isna().mean()
+        s_valid = s.dropna()
+        if len(s_valid) == 0:
+            continue
         lines.append(
-            f"{col:<22} {v.mean():>9.3f} {v.std():>9.3f} {skew:>6.2f}"
-            f" {v.min():>9.3f} {p25:>9.3f} {p50:>9.3f} {p75:>9.3f} {v.max():>9.3f}"
+            f"{col:<30} {s_valid.mean():>9.3f} {s_valid.std():>9.3f} {float(s_valid.skew()):>6.2f}"
+            f" {s_valid.min():>9.3f} {float(s_valid.median()):>9.3f} {s_valid.max():>9.3f} {pct_miss:>5.1f}%"
         )
 
-    lines += ["", "CORRELATION WITH TARGET (Pearson r):"]
-    corrs = sorted(
-        [(col, float(df_tr[col].corr(_as_series(y_tr, df_tr)))) for col in feature_names],
-        key=lambda x: abs(x[1]), reverse=True,
-    )
+    # ── Correlations ──────────────────────────────────────────────────────────
+    lines += ["", "CORRELATION WITH TARGET (Pearson r, numeric features):"]
+    target_series = _as_series(y_tr, df_tr)
+    corrs = []
+    for col in num_cols:
+        try:
+            r = float(df_tr[col].corr(target_series))
+            if not math.isnan(r):
+                corrs.append((col, r))
+        except Exception:
+            pass
+    corrs.sort(key=lambda x: abs(x[1]), reverse=True)
     for col, r in corrs:
-        lines.append(f"  {col:<22}: {r:+.4f}")
+        lines.append(f"  {col:<30}: {r:+.4f}")
 
     lines += ["", "INTER-FEATURE CORRELATIONS (|r| ≥ 0.4):"]
-    corr_mat = df_tr.corr()
-    pairs = [
-        (a, b, float(corr_mat.loc[a, b]))
-        for i, a in enumerate(feature_names)
-        for b in feature_names[i + 1:]
-        if abs(corr_mat.loc[a, b]) >= 0.4
-    ]
-    pairs.sort(key=lambda x: abs(x[2]), reverse=True)
-    if pairs:
-        for a, b, r in pairs:
-            lines.append(f"  {a} ↔ {b}: {r:+.4f}")
-    else:
-        lines.append("  (none above threshold)")
+    try:
+        corr_mat = df_tr[num_cols].corr()
+        pairs = [
+            (a, b, float(corr_mat.loc[a, b]))
+            for i, a in enumerate(num_cols)
+            for b in num_cols[i + 1:]
+            if abs(corr_mat.loc[a, b]) >= 0.4
+        ]
+        pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+        if pairs:
+            for a, b, r in pairs[:20]:   # cap at 20 to avoid token bloat
+                lines.append(f"  {a} ↔ {b}: {r:+.4f}")
+        else:
+            lines.append("  (none above threshold)")
+    except Exception:
+        lines.append("  (could not compute)")
 
     if task_cfg["task"] == "regression":
-        lines += ["", f"TARGET: mean={y_tr.mean():.4f}  std={y_tr.std():.4f}  skew={float(_as_series(y_tr, df_tr).skew()):.2f}  min={y_tr.min():.4f}  max={y_tr.max():.4f}"]
+        lines += ["", f"TARGET: mean={y_tr.mean():.4f}  std={y_tr.std():.4f}  "
+                      f"skew={float(_as_series(y_tr, df_tr).skew()):.2f}  "
+                      f"min={y_tr.min():.4f}  max={y_tr.max():.4f}"]
     else:
-        classes, counts = np.unique(y_tr, return_counts=True)
+        import numpy as _np
+        classes, counts = _np.unique(y_tr, return_counts=True)
         lines += ["", "TARGET CLASS DISTRIBUTION:"]
         for cls, cnt in zip(classes, counts):
             lines.append(f"  class {cls}: {cnt} ({100*cnt/len(y_tr):.1f}%)")
@@ -664,7 +719,10 @@ def load_or_generate_profile(
     if not INCLUDE_DATA_PROFILE:
         return None
 
-    profile_path = Path(f"data_profile_{task_cfg['dataset']}.md")
+    _profile_key = task_cfg.get("openml_id") or task_cfg.get("openml_suite") or task_cfg["dataset"]
+    _profile_idx = task_cfg.get("openml_suite_index", "")
+    _profile_sfx = f"_{_profile_idx}" if _profile_idx != "" else ""
+    profile_path = Path(f"data_profile_{_profile_key}{_profile_sfx}.md")
 
     if profile_path.exists() and not REGEN_PROFILE:
         print(f"Data profile     : loaded from {profile_path}")
@@ -673,6 +731,23 @@ def load_or_generate_profile(
     print("Generating data profile (one-time LLM call)...")
     stats = _compute_raw_stats(task_cfg, feature_names)
 
+    # ── Step 1: LLM field-type refinement ─────────────────────────────────────
+    from prepare import _load_raw, _get_field_types, _field_types_cache_path
+    from field_types import build_llm_refine_prompt, apply_llm_refinement, LLM_REFINE_SYSTEM
+
+    df_raw, _, openml_features = _load_raw(task_cfg)
+    field_types  = _get_field_types(task_cfg, df_raw, openml_features)
+    cache_path   = _field_types_cache_path(task_cfg)
+    refine_prompt = build_llm_refine_prompt(df_raw, field_types)
+
+    print("  Refining field types via LLM...")
+    refine_response = call_llm(
+        [{"role": "user", "content": refine_prompt}],
+        provider, model, LLM_REFINE_SYSTEM,
+    )
+    apply_llm_refinement(field_types, refine_response, cache_path)
+
+    # ── Step 2: Feature engineering insights ──────────────────────────────────
     messages = [{"role": "user", "content": f"Analyse this dataset for feature engineering:\n\n{stats}"}]
     insights = call_llm(messages, provider, model, _PROFILE_SYSTEM)
 

@@ -31,6 +31,8 @@ ALLOWED_OPS = {
     "polynomial", "interaction",
     # geographic
     "kmeans_cluster", "kmeans_distance", "distance_to_point",
+    # preprocessing (usually early in pipeline)
+    "fillna", "drop_missing_cols",
     # selection
     "drop", "select",
     # scaling (fit on train)
@@ -353,6 +355,58 @@ def _op_select(step, tr, va):
     """
     cols = [f for f in step["features"] if f in tr.columns]
     return tr[cols], va[cols]
+
+
+# ── Preprocessing ─────────────────────────────────────────────────────────────
+
+
+def _op_fillna(step, tr, va):
+    """Fill missing values (fit fill-value on train, apply to val).
+    params:
+      strategy (str) : "mean" | "median" | "mode" | "zero" | "constant"  [default: "mean"]
+      features (list): columns to fill — omit to fill all columns with any NaN
+      constant (num) : value used when strategy="constant"               [default: 0]
+    """
+    strategy = step.get("strategy", "mean")
+    constant = step.get("constant", 0)
+    cols     = step.get("features") or [c for c in tr.columns if tr[c].isna().any()]
+
+    for col in cols:
+        if col not in tr.columns:
+            continue
+        if strategy == "mean":
+            fill = tr[col].mean()
+        elif strategy == "median":
+            fill = tr[col].median()
+        elif strategy == "mode":
+            mode = tr[col].mode()
+            fill = mode.iloc[0] if len(mode) else 0
+        elif strategy == "zero":
+            fill = 0
+        elif strategy == "constant":
+            fill = constant
+        else:
+            raise ValueError(
+                f"Unknown fillna strategy {strategy!r}. "
+                "Use: mean, median, mode, zero, constant"
+            )
+        tr[col] = tr[col].fillna(fill)
+        va[col] = va[col].fillna(fill)
+
+    return tr, va
+
+
+def _op_drop_missing_cols(step, tr, va):
+    """Drop columns whose missing-value rate on the training set exceeds a threshold.
+    params:
+      threshold (float): fraction of missing values above which a column is dropped
+                         [default: 0.5  — drop columns with > 50% missing]
+    """
+    threshold = step.get("threshold", 0.5)
+    to_drop   = [c for c in tr.columns if tr[c].isna().mean() > threshold]
+    tr = tr.drop(columns=to_drop)
+    va = va.drop(columns=[c for c in to_drop if c in va.columns])
+    return tr, va
 
 
 # ── Scaling ───────────────────────────────────────────────────────────────────
