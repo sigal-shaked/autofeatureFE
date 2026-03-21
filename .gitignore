@@ -1,1 +1,14 @@
 __pycache__/
+.venv/
+
+# Runtime experiment artifacts — not source files
+results.tsv
+topk_pool.json
+field_types_*.json
+data_profile_*.md
+benchmark_results/
+titanic.csv
+*.csv
+
+# Notebook outputs (strip before committing)
+.ipynb_checkpoints/
