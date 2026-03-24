@@ -161,7 +161,7 @@ Original features: """ + names_str + """
 """) + (_FREESTYLE_REFERENCE if ALLOW_FREESTYLE else "")
 
 
-def _build_system_prompt(task_cfg: dict, feature_names: list[str]) -> str:
+def _build_system_prompt(task_cfg: dict, feature_names: list[str], data_profile: str | None = None) -> str:
     task        = task_cfg["task"]    # regression | classification
     metric_name = task_cfg["metric"]  # rmse | auc | logloss
     dataset     = task_cfg["dataset"]
@@ -257,7 +257,7 @@ STRATEGY TIPS
 - Prefer simple pipelines: a small metric gain with many extra features may not improve score.
 
 Think step by step, then output only the JSON.
-"""
+""" + (f"\nDATA INSIGHTS (one-time analysis of the raw dataset):\n{data_profile}\n" if data_profile else "")
 
 # ─── LLM client ───────────────────────────────────────────────────────────────
 
@@ -776,24 +776,22 @@ def build_messages(
     base: PoolEntry,
     records: list[Record],
     task_cfg: dict,
-    data_profile: str | None = None,
     tried_steps: set[str] | None = None,
 ) -> list[dict]:
     metric_name = task_cfg["metric"]
     base_json   = json.dumps({"description": base.description, "steps": base.steps}, indent=2)
 
-    profile_section = (
-        f"\nDATA INSIGHTS (one-time analysis of the raw dataset):\n{data_profile}\n"
-        if data_profile else ""
-    )
     history_section = (
         f"\nExperiment history (most recent last):\n{format_history(records, metric_name)}\n"
         if INCLUDE_HISTORY else ""
     )
 
     if tried_steps:
+        tried_list = sorted(tried_steps)  # stable ordering
+        cap = HISTORY_SIZE if HISTORY_SIZE > 0 else len(tried_list)
+        tried_list = tried_list[-cap:]
         tried_lines = []
-        for s in tried_steps:
+        for s in tried_list:
             ops = [step.get("op", "?") for step in json.loads(s)]
             tried_lines.append("  [" + ", ".join(ops) + "]")
         tried_section = (
@@ -811,7 +809,7 @@ Base pipeline for this iteration: rank {base.rank} — "{base.description}"
 ```json
 {base_json}
 ```
-{profile_section}{history_section}{tried_section}
+{history_section}{tried_section}
 Suggest ONE focused improvement to the BASE PIPELINE ABOVE that has NOT been tried yet, and return the complete updated pipeline.
 """
     return [{"role": "user", "content": content}]
@@ -828,7 +826,6 @@ def main(n_iterations: int | None = None) -> None:
     task_cfg = json.loads(TASK_FILE.read_text())
     from prepare import get_feature_names
     feature_names = get_feature_names()
-    system_prompt = _build_system_prompt(task_cfg, feature_names)
     metric_name   = task_cfg["metric"]
 
     print(f"Provider         : {provider}")
@@ -851,7 +848,8 @@ def main(n_iterations: int | None = None) -> None:
         print("     Only enable this on trusted, non-production machines.")
     print()
 
-    data_profile = load_or_generate_profile(task_cfg, feature_names, provider, model)
+    data_profile  = load_or_generate_profile(task_cfg, feature_names, provider, model)
+    system_prompt = _build_system_prompt(task_cfg, feature_names, data_profile)
 
     init_results()
     records  = load_results()
@@ -919,7 +917,7 @@ def main(n_iterations: int | None = None) -> None:
         base_config = {"description": base.description, "steps": base.steps}
         PIPELINE_FILE.write_text(json.dumps(base_config, indent=2) + "\n")
 
-        messages = build_messages(pool, base, records, task_cfg, data_profile, tried_steps)
+        messages = build_messages(pool, base, records, task_cfg, tried_steps)
 
         # ── LLM call ──────────────────────────────────────────────────────────
         new_config = None
