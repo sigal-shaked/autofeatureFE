@@ -105,14 +105,14 @@ Rules — strictly enforced; violations abort the run:
 
 def _build_operations_reference(feature_names: list[str]) -> str:
     names_str = ", ".join(feature_names)
-    return f"""\
+    return ("""\
 AVAILABLE OPERATIONS
 ====================
 All operations reference features by column name.  Binary / multi-feature ops
 create NEW columns; originals are kept unless you add a "drop" step.
 Steps are applied left-to-right; later steps can reference columns created earlier.
 
-Original features: {names_str}
+Original features: """ + names_str + """
 
 ── Unary transforms (modify a feature in-place) ─────────────────────────────
 {"op": "log1p",           "features": ["MedInc"]}
@@ -158,7 +158,7 @@ Original features: {names_str}
 {"op": "scale", "method": "robust"}     // RobustScaler (percentile-based)
 {"op": "scale", "method": "minmax"}     // MinMaxScaler → [0,1]
 {"op": "scale", "method": "quantile"}   // QuantileTransformer → N(0,1)
-""" + (_FREESTYLE_REFERENCE if ALLOW_FREESTYLE else "")
+""") + (_FREESTYLE_REFERENCE if ALLOW_FREESTYLE else "")
 
 
 def _build_system_prompt(task_cfg: dict, feature_names: list[str]) -> str:
@@ -404,10 +404,17 @@ def save_pool(pool: list[PoolEntry]) -> None:
 
 
 def update_pool(pool: list[PoolEntry], entry: PoolEntry, k: int) -> list[PoolEntry]:
-    """Add entry to pool, keep best k by score, re-rank."""
+    """Add entry to pool, deduplicate by steps, keep best k by score, re-rank."""
     pool = pool + [entry]
     pool.sort(key=lambda e: e.score)
-    pool = pool[:k]
+    seen: set[str] = set()
+    deduped: list[PoolEntry] = []
+    for e in pool:
+        key = json.dumps(e.steps, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
+    pool = deduped[:k]
     for i, e in enumerate(pool):
         e.rank = i + 1
     return pool
@@ -770,6 +777,7 @@ def build_messages(
     records: list[Record],
     task_cfg: dict,
     data_profile: str | None = None,
+    tried_steps: set[str] | None = None,
 ) -> list[dict]:
     metric_name = task_cfg["metric"]
     base_json   = json.dumps({"description": base.description, "steps": base.steps}, indent=2)
@@ -783,6 +791,18 @@ def build_messages(
         if INCLUDE_HISTORY else ""
     )
 
+    if tried_steps:
+        tried_lines = []
+        for s in tried_steps:
+            ops = [step.get("op", "?") for step in json.loads(s)]
+            tried_lines.append("  [" + ", ".join(ops) + "]")
+        tried_section = (
+            "\nALREADY EVALUATED (do NOT reproduce any of these exact op sequences):\n"
+            + "\n".join(tried_lines) + "\n"
+        )
+    else:
+        tried_section = ""
+
     content = f"""\
 Top-{TOPK} pipeline pool (rank 1 = best score):
 {format_pool(pool, metric_name)}
@@ -791,8 +811,8 @@ Base pipeline for this iteration: rank {base.rank} — "{base.description}"
 ```json
 {base_json}
 ```
-{profile_section}{history_section}
-Suggest ONE focused improvement to the BASE PIPELINE ABOVE and return the complete updated pipeline.
+{profile_section}{history_section}{tried_section}
+Suggest ONE focused improvement to the BASE PIPELINE ABOVE that has NOT been tried yet, and return the complete updated pipeline.
 """
     return [{"role": "user", "content": content}]
 
@@ -838,6 +858,7 @@ def main(n_iterations: int | None = None) -> None:
     pool     = load_pool()
     exp_n    = len(records) + 1
     pool_idx = 0   # round-robin cursor
+    tried_steps: set[str] = {json.dumps(e.steps, sort_keys=True) for e in pool}
 
     # ── Baseline or resume ────────────────────────────────────────────────────
     if pool:
@@ -898,7 +919,7 @@ def main(n_iterations: int | None = None) -> None:
         base_config = {"description": base.description, "steps": base.steps}
         PIPELINE_FILE.write_text(json.dumps(base_config, indent=2) + "\n")
 
-        messages = build_messages(pool, base, records, task_cfg, data_profile)
+        messages = build_messages(pool, base, records, task_cfg, data_profile, tried_steps)
 
         # ── LLM call ──────────────────────────────────────────────────────────
         new_config = None
@@ -940,6 +961,12 @@ def main(n_iterations: int | None = None) -> None:
         # ── Write & evaluate ──────────────────────────────────────────────────
         if not pipeline_changed(new_config, base_config):
             print("  Nothing changed vs base; skipping.")
+            exp_n += 1
+            continue
+
+        steps_key = json.dumps(new_config["steps"], sort_keys=True)
+        if steps_key in tried_steps:
+            print("  Already evaluated this exact pipeline; skipping.")
             exp_n += 1
             continue
 
@@ -991,6 +1018,7 @@ def main(n_iterations: int | None = None) -> None:
             write_pipeline(base_config)   # restore base; candidate didn't qualify
             pool_rank = None
 
+        tried_steps.add(steps_key)
         append_result(Record(
             timestamp=datetime.now().isoformat(timespec="seconds"),
             experiment=exp_n, description=description,

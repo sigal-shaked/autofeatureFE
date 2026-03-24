@@ -2,6 +2,8 @@ __pycache__/
 .venv/
 
 # Runtime experiment artifacts — not source files
+pipeline.json
+task.json
 results.tsv
 topk_pool.json
 field_types_*.json
